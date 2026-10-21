@@ -1,0 +1,66 @@
+/* BlackArch Cyberdeck Rofi Theme */
+* {
+    bg:          #090b10f2;
+    bg-alt:      #111520ff;
+    fg:          #e5e7ebff;
+    fg-muted:    #9ca3afff;
+    accent:      #ef4444ff;
+    cyan:        #06b6d4ff;
+    border-col:  #ef4444aa;
+    background-color: transparent;
+    text-color: @fg;
+    font: "JetBrainsMono Nerd Font 10";
+}
+
+window {
+    width: 68%;
+    background-color: @bg;
+    border: 2px;
+    border-color: @border-col;
+    border-radius: 8px;
+    padding: 18px;
+}
+
+mainbox {
+    children: [ inputbar, message, listview ];
+    spacing: 12px;
+}
+
+inputbar {
+    children: [ prompt, entry ];
+    background-color: @bg-alt;
+    border: 1px;
+    border-color: @cyan;
+    border-radius: 6px;
+    padding: 10px 14px;
+}
+
+prompt {
+    text-color: @accent;
+    padding: 0 12px 0 0;
+}
+
+entry {
+    placeholder: "Search BlackArch commands, tools, or categories...";
+    placeholder-color: @fg-muted;
+}
+
+listview {
+    lines: 14;
+    columns: 1;
+    fixed-height: false;
+    spacing: 4px;
+    scrollbar: true;
+}
+
+element {
+    padding: 8px 12px;
+    border-radius: 5px;
+}
+
+element selected.normal {
+    background-color: #ef444433;
+    text-color: #ffffffff;
+    border: 1px;
+    border-color: @accent;
+}

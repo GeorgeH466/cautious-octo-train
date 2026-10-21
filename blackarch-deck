@@ -1,0 +1,2694 @@
+#!/usr/bin/env python3
+"""
+BlackArch Cyberdeck UI & Menu-Driven Command Center (blackarch-deck)
+====================================================================
+A zero-dependency (Python 3 stdlib only) post-install Cyberdeck UI for
+BlackArch Linux Dual-Boot PCs.
+
+Modes:
+  blackarch-deck           -> Full-screen Terminal Curses Cyberdeck UI (TUI)
+  blackarch-deck --web     -> Graphical Web/App Cyberdeck UI server (0.0.0.0:8080)
+  blackarch-deck --gui     -> Starts Web UI + opens frameless desktop window
+  blackarch-deck --status  -> Prints colorized CLI telemetry & command summary
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import datetime
+import html
+import http.server
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Paths & Default Configuration
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parent
+CONFIG_DIR = Path.home() / ".config" / "blackarch-cyberdeck"
+COMMANDS_PATH = CONFIG_DIR / "commands.json"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+WEATHER_CACHE_PATH = CONFIG_DIR / "weather_cache.json"
+DEFAULT_COMMANDS_REPO_PATH = REPO_ROOT / "configs" / "commands.default.json"
+
+CATEGORIES = [
+    "★ Favorites",
+    "All Commands",
+    "Recon & OSINT",
+    "Web & API",
+    "Wi-Fi & Network",
+    "Exploit & Passwords",
+    "Forensics & RE",
+    "OPSEC & VPN",
+    "Dual-Boot & System",
+    "Custom",
+]
+
+
+def detect_default_interface() -> str:
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "show", "default"], text=True, stderr=subprocess.DEVNULL, timeout=2
+        )
+        parts = out.strip().split()
+        if "dev" in parts:
+            idx = parts.index("dev")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    except Exception:
+        pass
+    try:
+        net_dir = Path("/sys/class/net")
+        if net_dir.exists():
+            for iface in sorted(os.listdir(net_dir)):
+                if iface != "lo":
+                    return iface
+    except Exception:
+        pass
+    return "eth0"
+
+
+def detect_default_lhost() -> str:
+    # Prefer VPN tunnel if active (tun0 / wg0)
+    for vpn_iface in ("tun0", "wg0", "tap0"):
+        try:
+            out = subprocess.check_output(
+                ["ip", "-4", "-br", "addr", "show", vpn_iface],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+            ).strip()
+            if out:
+                parts = out.split()
+                if len(parts) >= 3:
+                    return parts[2].split("/")[0]
+        except Exception:
+            pass
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-br", "addr", "show", "scope", "global"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        ).strip()
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                return parts[2].split("/")[0]
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "location": "Wheathampstead, England, GB",
+    "latitude": 51.8127,
+    "longitude": -0.2948,
+    "temperature_unit": "C",
+    "privacy_mask_ip": False,
+    "target": "10.10.11.24",
+    "lhost": detect_default_lhost(),
+    "lport": "4444",
+    "interface": detect_default_interface(),
+    "wordlist": "/usr/share/wordlists/rockyou.txt",
+}
+
+
+def ensure_config_files() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
+    if not COMMANDS_PATH.exists():
+        if DEFAULT_COMMANDS_REPO_PATH.exists():
+            shutil.copyfile(DEFAULT_COMMANDS_REPO_PATH, COMMANDS_PATH)
+        else:
+            COMMANDS_PATH.write_text("[]", encoding="utf-8")
+
+
+def load_config() -> Dict[str, Any]:
+    ensure_config_files()
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        merged = dict(DEFAULT_CONFIG)
+        merged.update(data)
+        return merged
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    ensure_config_files()
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def load_commands() -> List[Dict[str, Any]]:
+    ensure_config_files()
+    try:
+        cmds = json.loads(COMMANDS_PATH.read_text(encoding="utf-8"))
+        if isinstance(cmds, list):
+            for c in cmds:
+                c["installed"] = bool(shutil.which(c.get("binary", "")))
+            return cmds
+    except Exception:
+        pass
+    if DEFAULT_COMMANDS_REPO_PATH.exists():
+        try:
+            cmds = json.loads(DEFAULT_COMMANDS_REPO_PATH.read_text(encoding="utf-8"))
+            for c in cmds:
+                c["installed"] = bool(shutil.which(c.get("binary", "")))
+            return cmds
+        except Exception:
+            pass
+    return []
+
+
+def save_commands(cmds: List[Dict[str, Any]]) -> None:
+    ensure_config_files()
+    clean = []
+    for c in cmds:
+        item = dict(c)
+        item.pop("installed", None)
+        clean.append(item)
+    COMMANDS_PATH.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+
+
+def render_command_template(cmd_template: str, cfg: Dict[str, Any]) -> str:
+    rendered = cmd_template
+    replacements = {
+        "{target}": str(cfg.get("target", "127.0.0.1")),
+        "{lhost}": str(cfg.get("lhost", "127.0.0.1")),
+        "{lport}": str(cfg.get("lport", "4444")),
+        "{interface}": str(cfg.get("interface", "eth0")),
+        "{wordlist}": str(cfg.get("wordlist", "/usr/share/wordlists/rockyou.txt")),
+    }
+    for k, v in replacements.items():
+        rendered = rendered.replace(k, v)
+    return rendered
+
+
+# ---------------------------------------------------------------------------
+# Live Telemetry Engine (Hardware, Sensors, Network, Dual-Boot, Weather)
+# ---------------------------------------------------------------------------
+class TelemetryEngine:
+    def __init__(self) -> None:
+        self._prev_cpu_times: Optional[Dict[str, Tuple[int, int]]] = None
+        self._prev_net_bytes: Optional[Tuple[float, int, int]] = None
+        self._cached_gpu: Optional[str] = None
+        self._cached_pkg_counts: Optional[Tuple[int, int]] = None
+        self._cached_public_ip: str = "Checking..."
+        self._last_pub_ip_check: float = 0.0
+        self._weather_data: Optional[Dict[str, Any]] = None
+        self._last_weather_fetch: float = 0.0
+        self._weather_lock = threading.Lock()
+        # Prime initial CPU sample
+        self._read_cpu_samples()
+
+    def _read_cpu_samples(self) -> Dict[str, Tuple[int, int]]:
+        samples: Dict[str, Tuple[int, int]] = {}
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("cpu"):
+                        parts = line.split()
+                        name = parts[0]
+                        nums = [int(x) for x in parts[1:]]
+                        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+                        total = sum(nums)
+                        samples[name] = (idle, total)
+        except Exception:
+            pass
+        return samples
+
+    def get_cpu_telemetry(self) -> Dict[str, Any]:
+        model = platform.processor() or "x86_64 Processor"
+        freq_mhz = 0.0
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if "model name" in line and model in ("", "x86_64", "x86_64 Processor"):
+                        model = line.split(":", 1)[1].strip()
+                    elif "cpu MHz" in line and freq_mhz == 0.0:
+                        freq_mhz = float(line.split(":", 1)[1].strip())
+        except Exception:
+            pass
+
+        cur = self._read_cpu_samples()
+        prev = self._prev_cpu_times or cur
+        self._prev_cpu_times = cur
+
+        def calc_pct(key: str) -> float:
+            if key not in cur or key not in prev:
+                return 0.0
+            idle_d = cur[key][0] - prev[key][0]
+            total_d = cur[key][1] - prev[key][1]
+            if total_d <= 0:
+                return 0.0
+            return max(0.0, min(100.0, 100.0 * (1.0 - idle_d / total_d)))
+
+        total_pct = round(calc_pct("cpu"), 1)
+        core_keys = sorted(
+            [k for k in cur.keys() if k != "cpu" and k.startswith("cpu")],
+            key=lambda x: int(x[3:]) if x[3:].isdigit() else 0,
+        )
+        per_core = [round(calc_pct(k), 1) for k in core_keys]
+
+        # Read temperature from thermal_zone or hwmon
+        temp_c: Optional[float] = None
+        try:
+            for tz in sorted(Path("/sys/class/thermal").glob("thermal_zone*/temp")):
+                raw = int(tz.read_text(encoding="utf-8").strip())
+                if raw > 1000:
+                    temp_c = round(raw / 1000.0, 1)
+                    break
+        except Exception:
+            pass
+        if temp_c is None:
+            try:
+                for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*/temp*_input")):
+                    raw = int(hw.read_text(encoding="utf-8").strip())
+                    if raw > 1000:
+                        temp_c = round(raw / 1000.0, 1)
+                        break
+            except Exception:
+                pass
+
+        return {
+            "model": model,
+            "cores": len(per_core) or (os.cpu_count() or 1),
+            "freq_mhz": round(freq_mhz, 0),
+            "usage_pct": total_pct,
+            "per_core": per_core[:16],
+            "temp_c": temp_c,
+        }
+
+    def get_gpu_info(self) -> str:
+        if self._cached_gpu is not None:
+            return self._cached_gpu
+        gpu_str = "Integrated / Standard Display Adapter"
+        try:
+            if shutil.which("lspci"):
+                out = subprocess.check_output(
+                    ["lspci"], text=True, stderr=subprocess.DEVNULL, timeout=2
+                )
+                for line in out.splitlines():
+                    if any(k in line for k in ("VGA compatible controller", "3D controller", "Display controller")):
+                        gpu_str = line.split(": ", 1)[-1].strip()
+                        break
+        except Exception:
+            pass
+        self._cached_gpu = gpu_str
+        return gpu_str
+
+    def get_memory_telemetry(self) -> Dict[str, Any]:
+        info: Dict[str, int] = {}
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        val_kb = int(parts[1].strip().split()[0])
+                        info[key] = val_kb
+        except Exception:
+            pass
+        total_kb = info.get("MemTotal", 1)
+        avail_kb = info.get("MemAvailable", info.get("MemFree", 0))
+        used_kb = max(0, total_kb - avail_kb)
+        cached_kb = info.get("Cached", 0) + info.get("Buffers", 0)
+        swap_total_kb = info.get("SwapTotal", 0)
+        swap_free_kb = info.get("SwapFree", 0)
+        swap_used_kb = max(0, swap_total_kb - swap_free_kb)
+
+        return {
+            "total_gb": round(total_kb / (1024 * 1024), 2),
+            "used_gb": round(used_kb / (1024 * 1024), 2),
+            "avail_gb": round(avail_kb / (1024 * 1024), 2),
+            "cached_gb": round(cached_kb / (1024 * 1024), 2),
+            "pct": round((used_kb / total_kb) * 100.0, 1) if total_kb else 0.0,
+            "swap_total_gb": round(swap_total_kb / (1024 * 1024), 2),
+            "swap_used_gb": round(swap_used_kb / (1024 * 1024), 2),
+            "swap_pct": round((swap_used_kb / swap_total_kb) * 100.0, 1) if swap_total_kb else 0.0,
+        }
+
+    def get_storage_and_dualboot(self) -> Dict[str, Any]:
+        mounts: List[Dict[str, Any]] = []
+        seen_devs = set()
+        candidate_paths = ["/", "/home", "/mnt/windows", "/mnt/shared", "/boot/efi"]
+        try:
+            with open("/proc/mounts", "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        dev, mnt, fstype = parts[0], parts[1], parts[2]
+                        if fstype in ("ext4", "btrfs", "xfs", "zfs", "ntfs", "ntfs3", "fuseblk", "vfat", "exfat", "overlay"):
+                            if mnt not in candidate_paths and not mnt.startswith("/Docker") and not mnt.startswith("/etc"):
+                                candidate_paths.append(mnt)
+        except Exception:
+            pass
+
+        for path in candidate_paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                st = shutil.disk_usage(path)
+                if st.total <= 0:
+                    continue
+                key = (st.total, st.free)
+                if path != "/" and key in seen_devs:
+                    continue
+                seen_devs.add(key)
+                pct = round((st.used / st.total) * 100.0, 1)
+                mounts.append(
+                    {
+                        "mount": path,
+                        "total_gb": round(st.total / (1024**3), 1),
+                        "used_gb": round(st.used / (1024**3), 1),
+                        "free_gb": round(st.free / (1024**3), 1),
+                        "pct": pct,
+                    }
+                )
+            except Exception:
+                pass
+
+        # Detect unmounted or mounted dual-boot partitions via lsblk if available
+        partitions: List[Dict[str, str]] = []
+        windows_detected = False
+        try:
+            out = subprocess.check_output(
+                ["lsblk", "-J", "-o", "NAME,FSTYPE,SIZE,MOUNTPOINT,LABEL"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            data = json.loads(out)
+            for dev in data.get("blockdevices", []):
+                children = dev.get("children", [dev])
+                for part in children:
+                    fstype = (part.get("fstype") or "").lower()
+                    label = part.get("label") or ""
+                    if fstype in ("ntfs", "BitLocker", "vfat", "exfat", "ext4", "btrfs", "xfs"):
+                        if fstype == "ntfs" or "windows" in label.lower():
+                            windows_detected = True
+                        partitions.append(
+                            {
+                                "name": f"/dev/{part.get('name', '')}",
+                                "fstype": fstype or "raw",
+                                "size": part.get("size") or "",
+                                "mountpoint": part.get("mountpoint") or "unmounted",
+                                "label": label,
+                            }
+                        )
+        except Exception:
+            pass
+
+        # Check RTC mode (UTC vs Local for Windows dual-boot)
+        rtc_local = False
+        try:
+            if Path("/etc/adjtime").exists():
+                content = Path("/etc/adjtime").read_text(encoding="utf-8")
+                rtc_local = "LOCAL" in content
+        except Exception:
+            pass
+
+        return {
+            "mounts": mounts[:5],
+            "partitions": partitions[:8],
+            "windows_detected": windows_detected,
+            "rtc_mode": "LOCAL (Dual-Boot Safe)" if rtc_local else "UTC (Standard Linux)",
+        }
+
+    def get_power_status(self) -> Dict[str, Any]:
+        try:
+            ps_base = Path("/sys/class/power_supply")
+            if ps_base.exists():
+                for bat in sorted(ps_base.glob("BAT*")):
+                    cap = (bat / "capacity").read_text(encoding="utf-8").strip()
+                    status = (bat / "status").read_text(encoding="utf-8").strip()
+                    return {"has_battery": True, "percent": int(cap), "status": status}
+        except Exception:
+            pass
+        return {"has_battery": False, "percent": 100, "status": "AC WORKSTATION"}
+
+    def get_system_identity(self) -> Dict[str, Any]:
+        now = datetime.datetime.now().astimezone()
+        uptime_str = "0m"
+        try:
+            with open("/proc/uptime", "r", encoding="utf-8") as f:
+                up_sec = int(float(f.read().split()[0]))
+                days, rem = divmod(up_sec, 86400)
+                hours, rem = divmod(rem, 3600)
+                mins, _ = divmod(rem, 60)
+                if days > 0:
+                    uptime_str = f"{days}d {hours}h {mins}m"
+                elif hours > 0:
+                    uptime_str = f"{hours}h {mins}m"
+                else:
+                    uptime_str = f"{mins}m"
+        except Exception:
+            pass
+
+        os_name = "BlackArch Linux"
+        try:
+            if Path("/etc/os-release").exists():
+                for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+                    if line.startswith("PRETTY_NAME="):
+                        os_name = line.split("=", 1)[1].strip().strip('"')
+                        break
+        except Exception:
+            pass
+
+        if self._cached_pkg_counts is None:
+            total_pkgs = 0
+            ba_pkgs = 0
+            try:
+                if shutil.which("pacman"):
+                    out = subprocess.check_output(["pacman", "-Qq"], text=True, stderr=subprocess.DEVNULL, timeout=2)
+                    total_pkgs = len(out.strip().splitlines())
+                    out_ba = subprocess.check_output(
+                        ["pacman", "-Sl", "blackarch"], text=True, stderr=subprocess.DEVNULL, timeout=2
+                    )
+                    ba_pkgs = sum(1 for l in out_ba.splitlines() if "[installed]" in l)
+                elif shutil.which("dpkg-query"):
+                    out = subprocess.check_output(
+                        ["dpkg-query", "-f", "${binary:Package}\n", "-W"],
+                        text=True,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    )
+                    total_pkgs = len(out.strip().splitlines())
+            except Exception:
+                pass
+            self._cached_pkg_counts = (total_pkgs, ba_pkgs)
+
+        load1, load5, load15 = (0.0, 0.0, 0.0)
+        try:
+            load1, load5, load15 = os.getloadavg()
+        except Exception:
+            pass
+
+        return {
+            "hostname": socket.gethostname(),
+            "os": os_name,
+            "kernel": platform.release(),
+            "arch": platform.machine(),
+            "uptime": uptime_str,
+            "time": now.strftime("%H:%M:%S"),
+            "date": now.strftime("%a, %d %b %Y"),
+            "timezone": str(now.tzinfo or "Europe/London"),
+            "load_avg": f"{load1:.2f} / {load5:.2f} / {load15:.2f}",
+            "packages_total": self._cached_pkg_counts[0],
+            "packages_blackarch": self._cached_pkg_counts[1],
+        }
+
+    def get_network_and_opsec(self, mask_ip: bool = False) -> Dict[str, Any]:
+        interfaces: List[Dict[str, str]] = []
+        vpn_active = False
+        vpn_ip = ""
+        vpn_iface = ""
+
+        try:
+            out = subprocess.check_output(
+                ["ip", "-4", "-br", "addr"], text=True, stderr=subprocess.DEVNULL, timeout=2
+            )
+            for line in out.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    iface, state, addr = parts[0], parts[1], parts[2].split("/")[0]
+                    if iface == "lo":
+                        continue
+                    interfaces.append({"iface": iface, "state": state, "ip": addr})
+                    if iface.startswith(("tun", "wg", "tap", "proton")):
+                        vpn_active = True
+                        vpn_ip = addr
+                        vpn_iface = iface
+        except Exception:
+            pass
+
+        # Network throughput (RX / TX KB/s)
+        rx_kbps = 0.0
+        tx_kbps = 0.0
+        total_rx = 0
+        total_tx = 0
+        now_t = time.time()
+        try:
+            with open("/proc/net/dev", "r", encoding="utf-8") as f:
+                for line in f.readlines()[2:]:
+                    if ":" not in line:
+                        continue
+                    iface, rest = line.split(":", 1)
+                    iface = iface.strip()
+                    if iface == "lo":
+                        continue
+                    cols = rest.split()
+                    if len(cols) >= 9:
+                        total_rx += int(cols[0])
+                        total_tx += int(cols[8])
+            if self._prev_net_bytes is not None:
+                dt = max(0.2, now_t - self._prev_net_bytes[0])
+                rx_kbps = round((total_rx - self._prev_net_bytes[1]) / 1024.0 / dt, 1)
+                tx_kbps = round((total_tx - self._prev_net_bytes[2]) / 1024.0 / dt, 1)
+            self._prev_net_bytes = (now_t, total_rx, total_tx)
+        except Exception:
+            pass
+
+        # Listening ports
+        listening_ports: List[str] = []
+        tor_active = False
+        try:
+            out = subprocess.check_output(
+                ["ss", "-tln"], text=True, stderr=subprocess.DEVNULL, timeout=2
+            )
+            for line in out.splitlines()[1:]:
+                cols = line.split()
+                if len(cols) >= 4:
+                    local_addr = cols[3]
+                    port = local_addr.rsplit(":", 1)[-1]
+                    if port == "9050":
+                        tor_active = True
+                    if port not in listening_ports:
+                        listening_ports.append(port)
+        except Exception:
+            pass
+
+        # Public IP check (cached asynchronously so UI never blocks)
+        if now_t - self._last_pub_ip_check > 300:
+            self._last_pub_ip_check = now_t
+            threading.Thread(target=self._refresh_public_ip, daemon=True).start()
+
+        pub_ip_display = self._cached_public_ip
+        if mask_ip and pub_ip_display not in ("Offline / Restricted", "Checking..."):
+            pub_ip_display = "***.***.***.*** (MASKED)"
+
+        return {
+            "interfaces": interfaces,
+            "vpn_active": vpn_active,
+            "vpn_iface": vpn_iface,
+            "vpn_ip": vpn_ip,
+            "tor_active": tor_active,
+            "public_ip": pub_ip_display,
+            "rx_kbps": max(0.0, rx_kbps),
+            "tx_kbps": max(0.0, tx_kbps),
+            "total_rx_mb": round(total_rx / (1024 * 1024), 1),
+            "total_tx_mb": round(total_tx / (1024 * 1024), 1),
+            "listening_ports": listening_ports[:10],
+        }
+
+    def _refresh_public_ip(self) -> None:
+        for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+                with urllib.request.urlopen(req, timeout=2.5) as resp:
+                    ip = resp.read().decode("utf-8").strip()
+                    if ip and len(ip) <= 45:
+                        self._cached_public_ip = ip
+                        return
+            except Exception:
+                pass
+        self._cached_public_ip = "Offline / Lab VLAN"
+
+    def get_top_processes(self) -> List[Dict[str, str]]:
+        procs: List[Dict[str, str]] = []
+        try:
+            out = subprocess.check_output(
+                ["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            for line in out.strip().splitlines()[1:7]:
+                parts = line.split(None, 3)
+                if len(parts) == 4:
+                    procs.append(
+                        {"pid": parts[0], "name": parts[1][:18], "cpu": parts[2], "mem": parts[3]}
+                    )
+        except Exception:
+            pass
+        return procs
+
+    def get_weather(self, cfg: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
+        now_t = time.time()
+        location = cfg.get("location", "Wheathampstead, England, GB")
+        if not force and self._weather_data and (now_t - self._last_weather_fetch < 600):
+            if self._weather_data.get("queried_location") == location:
+                return self._weather_data
+
+        # Trigger async refresh if we already have data, or synchronous first time with short timeout
+        if self._weather_data is None or force:
+            self._fetch_weather_sync(cfg)
+        else:
+            threading.Thread(target=self._fetch_weather_sync, args=(cfg,), daemon=True).start()
+        return self._weather_data or self._fallback_weather(location)
+
+    def _fetch_weather_sync(self, cfg: Dict[str, Any]) -> None:
+        with self._weather_lock:
+            location = cfg.get("location", "Wheathampstead, England, GB")
+            lat = float(cfg.get("latitude", 51.8127))
+            lon = float(cfg.get("longitude", -0.2948))
+
+            # 1. Try Open-Meteo Geocoding + Forecast API (fast, no API key required on BlackArch PC)
+            try:
+                city_query = urllib.parse.quote(location.split(",")[0].strip())
+                geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city_query}&count=1&language=en&format=json"
+                req = urllib.request.Request(geo_url, headers={"User-Agent": "BlackArch-Cyberdeck/1.0"})
+                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                    geo_data = json.loads(resp.read().decode("utf-8"))
+                    if geo_data.get("results"):
+                        r0 = geo_data["results"][0]
+                        lat = float(r0["latitude"])
+                        lon = float(r0["longitude"])
+                        location = f"{r0.get('name')}, {r0.get('admin1', '')}, {r0.get('country_code', '')}".replace(", ,", ",")
+
+                wx_url = (
+                    f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+                    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure"
+                    "&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=3"
+                )
+                req2 = urllib.request.Request(wx_url, headers={"User-Agent": "BlackArch-Cyberdeck/1.0"})
+                with urllib.request.urlopen(req2, timeout=2.5) as resp2:
+                    wx = json.loads(resp2.read().decode("utf-8"))
+                    cur = wx.get("current", {})
+                    daily = wx.get("daily", {})
+                    code = int(cur.get("weather_code", 2))
+                    cond_text, cond_icon = self._wmo_code_to_text(code)
+                    forecast = []
+                    dates = daily.get("time", [])
+                    maxs = daily.get("temperature_2m_max", [])
+                    mins = daily.get("temperature_2m_min", [])
+                    codes = daily.get("weather_code", [])
+                    for i in range(min(3, len(dates))):
+                        ft, fi = self._wmo_code_to_text(int(codes[i]))
+                        forecast.append(
+                            {
+                                "date": dates[i],
+                                "condition": ft,
+                                "icon": fi,
+                                "max_c": round(maxs[i], 1),
+                                "min_c": round(mins[i], 1),
+                            }
+                        )
+                    result = {
+                        "location": location,
+                        "queried_location": cfg.get("location", location),
+                        "temp_c": round(float(cur.get("temperature_2m", 13.0)), 1),
+                        "feels_like_c": round(float(cur.get("apparent_temperature", 11.5)), 1),
+                        "humidity": int(cur.get("relative_humidity_2m", 76)),
+                        "wind_kmh": round(float(cur.get("wind_speed_10m", 14.0)), 1),
+                        "pressure_hpa": int(float(cur.get("surface_pressure", 1014))),
+                        "condition": cond_text,
+                        "icon": cond_icon,
+                        "forecast": forecast,
+                        "source": "Live Open-Meteo",
+                        "updated_at": datetime.datetime.now().strftime("%H:%M"),
+                    }
+                    self._weather_data = result
+                    self._last_weather_fetch = time.time()
+                    try:
+                        WEATHER_CACHE_PATH.write_text(json.dumps(result, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+
+            # 2. Try wttr.in JSON API fallback
+            try:
+                q = urllib.parse.quote(location.split(",")[0].strip())
+                wttr_url = f"https://wttr.in/{q}?format=j1"
+                req = urllib.request.Request(wttr_url, headers={"User-Agent": "curl/8.0"})
+                with urllib.request.urlopen(req, timeout=2.5) as resp:
+                    wdata = json.loads(resp.read().decode("utf-8"))
+                    cur = wdata["current_condition"][0]
+                    desc = cur["weatherDesc"][0]["value"]
+                    forecast = []
+                    for day in wdata.get("weather", [])[:3]:
+                        forecast.append(
+                            {
+                                "date": day.get("date", ""),
+                                "condition": day["hourly"][4]["weatherDesc"][0]["value"],
+                                "icon": "⛅",
+                                "max_c": float(day.get("maxtempC", 14)),
+                                "min_c": float(day.get("mintempC", 7)),
+                            }
+                        )
+                    result = {
+                        "location": location,
+                        "queried_location": cfg.get("location", location),
+                        "temp_c": float(cur.get("temp_C", 13)),
+                        "feels_like_c": float(cur.get("FeelsLikeC", 12)),
+                        "humidity": int(cur.get("humidity", 75)),
+                        "wind_kmh": float(cur.get("windspeedKmph", 15)),
+                        "pressure_hpa": int(cur.get("pressure", 1015)),
+                        "condition": desc,
+                        "icon": "⛅",
+                        "forecast": forecast,
+                        "source": "Live wttr.in",
+                        "updated_at": datetime.datetime.now().strftime("%H:%M"),
+                    }
+                    self._weather_data = result
+                    self._last_weather_fetch = time.time()
+                    try:
+                        WEATHER_CACHE_PATH.write_text(json.dumps(result, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+
+            # 3. Check local cache or seasonal estimation when offline / in airgapped lab
+            if WEATHER_CACHE_PATH.exists():
+                try:
+                    cached = json.loads(WEATHER_CACHE_PATH.read_text(encoding="utf-8"))
+                    cached["queried_location"] = location
+                    cached["location"] = location
+                    cached["source"] = "Cached Telemetry"
+                    self._weather_data = cached
+                    self._last_weather_fetch = time.time()
+                    return
+                except Exception:
+                    pass
+
+            self._weather_data = self._fallback_weather(location)
+            self._last_weather_fetch = time.time()
+
+    @staticmethod
+    def _wmo_code_to_text(code: int) -> Tuple[str, str]:
+        mapping = {
+            0: ("Clear Sky", "☀"),
+            1: ("Mainly Clear", "🌤"),
+            2: ("Partly Cloudy", "⛅"),
+            3: ("Overcast", "☁"),
+            45: ("Mist / Fog", "🌫"),
+            48: ("Rime Fog", "🌫"),
+            51: ("Light Drizzle", "🌦"),
+            53: ("Moderate Drizzle", "🌦"),
+            55: ("Dense Drizzle", "🌧"),
+            61: ("Light Rain", "🌧"),
+            63: ("Moderate Rain", "🌧"),
+            65: ("Heavy Rain", "🌧"),
+            71: ("Light Snow", "🌨"),
+            80: ("Rain Showers", "🌦"),
+            95: ("Thunderstorm", "⛈"),
+        }
+        return mapping.get(code, ("Partly Cloudy", "⛅"))
+
+    @staticmethod
+    def _fallback_weather(location: str) -> Dict[str, Any]:
+        now = datetime.datetime.now()
+        hour = now.hour
+        is_night = hour < 7 or hour >= 19
+        base_temp = 11.4 if is_night else 14.2
+        today = now.date()
+        return {
+            "location": location,
+            "queried_location": location,
+            "temp_c": base_temp,
+            "feels_like_c": round(base_temp - 1.3, 1),
+            "humidity": 78,
+            "wind_kmh": 14.5,
+            "pressure_hpa": 1016,
+            "condition": "Clear Night" if is_night else "Partly Cloudy",
+            "icon": "🌙" if is_night else "⛅",
+            "forecast": [
+                {
+                    "date": str(today),
+                    "condition": "Partly Cloudy",
+                    "icon": "⛅",
+                    "max_c": 15.0,
+                    "min_c": 8.2,
+                },
+                {
+                    "date": str(today + datetime.timedelta(days=1)),
+                    "condition": "Light Showers",
+                    "icon": "🌦",
+                    "max_c": 13.8,
+                    "min_c": 7.5,
+                },
+                {
+                    "date": str(today + datetime.timedelta(days=2)),
+                    "condition": "Mostly Clear",
+                    "icon": "🌤",
+                    "max_c": 14.6,
+                    "min_c": 7.9,
+                },
+            ],
+            "source": "Local Station Est. (Offline/Lab)",
+            "updated_at": now.strftime("%H:%M"),
+        }
+
+    def collect_all(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "system": self.get_system_identity(),
+            "cpu": self.get_cpu_telemetry(),
+            "gpu": self.get_gpu_info(),
+            "memory": self.get_memory_telemetry(),
+            "storage": self.get_storage_and_dualboot(),
+            "power": self.get_power_status(),
+            "network": self.get_network_and_opsec(mask_ip=bool(cfg.get("privacy_mask_ip", False))),
+            "processes": self.get_top_processes(),
+            "weather": self.get_weather(cfg),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Terminal Curses Cyberdeck UI (TUI Mode)
+# ---------------------------------------------------------------------------
+class CyberdeckTUI:
+    def __init__(self, engine: TelemetryEngine) -> None:
+        self.engine = engine
+        self.cfg = load_config()
+        self.commands = load_commands()
+        self.cat_idx = 0
+        self.cmd_idx = 0
+        self.search_query = ""
+        self.output_lines: List[str] = [
+            "[BLACKARCH CYBERDECK INITIALIZED]",
+            "Tip: Use [Tab / Left / Right] to switch categories, [Up / Down] to browse commands.",
+            "Tip: Press [Enter] to review & execute a command, [t] to set Target/LHOST, [w] for Weather city, [a] to Add Custom Command.",
+        ]
+        self.status_msg = "READY // Press [?] for Help | [q] to Quit"
+
+    def filtered_commands(self) -> List[Dict[str, Any]]:
+        cat = CATEGORIES[self.cat_idx]
+        result = []
+        q = self.search_query.lower().strip()
+        for c in self.commands:
+            if cat == "★ Favorites" and not c.get("favorite"):
+                continue
+            elif cat not in ("★ Favorites", "All Commands") and c.get("category") != cat:
+                continue
+            if q:
+                hay = f"{c.get('name','')} {c.get('cmd','')} {c.get('description','')} {' '.join(c.get('tags',[]))}".lower()
+                if q not in hay:
+                    continue
+            result.append(c)
+        return result
+
+    @staticmethod
+    def _bar(pct: float, width: int = 16) -> str:
+        width = max(4, width)
+        filled = int(round((max(0.0, min(100.0, pct)) / 100.0) * width))
+        return "█" * filled + "░" * (width - filled)
+
+    def _prompt_input(self, stdscr: Any, title: str, initial: str = "") -> Optional[str]:
+        h, w = stdscr.getmaxyx()
+        box_w = min(w - 6, max(50, len(title) + 20))
+        box_h = 7
+        y0 = max(1, (h - box_h) // 2)
+        x0 = max(2, (w - box_w) // 2)
+
+        win = curses.newwin(box_h, box_w, y0, x0)
+        win.keypad(True)
+        buf = list(initial)
+        cursor = len(buf)
+        curses.curs_set(1)
+
+        while True:
+            win.erase()
+            win.attron(curses.color_pair(1) | curses.A_BOLD)
+            win.border()
+            win.addstr(0, 2, f" {title[:box_w-6]} ")
+            win.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+            win.addstr(2, 2, "Input (Enter=Save, Esc=Cancel):", curses.color_pair(4))
+            field_w = box_w - 4
+            text_str = "".join(buf)
+            start_off = max(0, cursor - field_w + 2)
+            visible = text_str[start_off : start_off + field_w - 1]
+            win.addstr(3, 2, " " * (field_w), curses.A_REVERSE)
+            win.addstr(3, 2, visible, curses.A_REVERSE | curses.color_pair(2))
+            win.move(3, 2 + min(field_w - 2, cursor - start_off))
+            win.refresh()
+
+            ch = win.getch()
+            if ch in (10, 13, curses.KEY_ENTER):
+                curses.curs_set(0)
+                return "".join(buf)
+            elif ch == 27:  # ESC
+                curses.curs_set(0)
+                return None
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                if cursor > 0:
+                    buf.pop(cursor - 1)
+                    cursor -= 1
+            elif ch == curses.KEY_DC:
+                if cursor < len(buf):
+                    buf.pop(cursor)
+            elif ch == curses.KEY_LEFT:
+                cursor = max(0, cursor - 1)
+            elif ch == curses.KEY_RIGHT:
+                cursor = min(len(buf), cursor + 1)
+            elif ch == curses.KEY_HOME:
+                cursor = 0
+            elif ch == curses.KEY_END:
+                cursor = len(buf)
+            elif 32 <= ch <= 126:
+                buf.insert(cursor, chr(ch))
+                cursor += 1
+
+    def _run_command_capture(self, cmd_str: str) -> None:
+        self.output_lines = [f"$ {cmd_str}", "-" * 60]
+        try:
+            proc = subprocess.Popen(
+                cmd_str,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            out, _ = proc.communicate(timeout=25)
+            for line in (out or "").splitlines()[-60:]:
+                self.output_lines.append(line)
+            self.output_lines.append(f"[Exit Code: {proc.returncode}]")
+            self.status_msg = f"Completed command (exit {proc.returncode})"
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.output_lines.append("[Timed out after 25s in embedded view - use 'x' for interactive terminal]")
+            self.status_msg = "Command timed out in embedded capture; press 'x' for full interactive TTY"
+        except Exception as exc:
+            self.output_lines.append(f"[Error: {exc}]")
+            self.status_msg = f"Error: {exc}"
+
+    def _run_command_interactive(self, stdscr: Any, cmd_str: str) -> None:
+        curses.def_prog_mode()
+        curses.endwin()
+        print("\033[1;31m╔══════════════════════════════════════════════════════════════════════════╗\033[0m")
+        print(f"\033[1;31m║ BLACKARCH CYBERDECK // INTERACTIVE EXECUTION                             ║\033[0m")
+        print("\033[1;31m╚══════════════════════════════════════════════════════════════════════════╝\033[0m")
+        print(f"\033[1;36m$ {cmd_str}\033[0m\n")
+        try:
+            rc = subprocess.call(cmd_str, shell=True)
+            print(f"\n\033[1;32m[Command finished with exit code {rc}. Press Enter to return to Cyberdeck UI...]\033[0m")
+            input()
+        except KeyboardInterrupt:
+            print("\n\033[1;33m[Interrupted. Press Enter to return to Cyberdeck UI...]\033[0m")
+            input()
+        curses.reset_prog_mode()
+        stdscr.clear()
+        stdscr.refresh()
+        self.status_msg = "Returned from interactive terminal session."
+
+    def _safe_add(self, stdscr: Any, y: int, x: int, text: str, attr: int = 0) -> None:
+        h, w = stdscr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        max_len = w - x - 1
+        if max_len <= 0:
+            return
+        try:
+            stdscr.addstr(y, x, text[:max_len], attr)
+        except curses.error:
+            pass
+
+    def run(self, stdscr: Any) -> None:
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)      # Crimson accent
+        curses.init_pair(2, curses.COLOR_CYAN, -1)     # Cyber cyan
+        curses.init_pair(3, curses.COLOR_GREEN, -1)    # Neon green
+        curses.init_pair(4, curses.COLOR_WHITE, -1)    # Neutral white
+        curses.init_pair(5, curses.COLOR_YELLOW, -1)   # Warning / Star
+
+        stdscr.nodelay(True)
+        stdscr.timeout(1000)
+
+        last_telemetry = 0.0
+        snap: Dict[str, Any] = self.engine.collect_all(self.cfg)
+
+        while True:
+            now = time.time()
+            if now - last_telemetry >= 1.5:
+                snap = self.engine.collect_all(self.cfg)
+                last_telemetry = now
+
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+
+            sys_info = snap["system"]
+            cpu = snap["cpu"]
+            mem = snap["memory"]
+            storage = snap["storage"]
+            power = snap["power"]
+            net = snap["network"]
+            wx = snap["weather"]
+            procs = snap["processes"]
+
+            # 1. Top Cyberdeck Header Bar
+            header_line = (
+                f" ⚔ BLACKARCH // CYBERDECK  │  {sys_info['Hostname'] if 'Hostname' in sys_info else sys_info['hostname']} ({sys_info['kernel']})"
+                f"  │  UP: {sys_info['uptime']}  │  RTC: {storage['rtc_mode'].split()[0]}"
+            )
+            clock_str = f"🕒 {sys_info['time']}  {sys_info['date']} "
+            self._safe_add(stdscr, 0, 0, " " * (w - 1), curses.A_REVERSE | curses.color_pair(1))
+            self._safe_add(stdscr, 0, 0, header_line, curses.A_REVERSE | curses.color_pair(1) | curses.A_BOLD)
+            if w > len(clock_str) + 10:
+                self._safe_add(
+                    stdscr,
+                    0,
+                    w - len(clock_str) - 1,
+                    clock_str,
+                    curses.A_REVERSE | curses.color_pair(2) | curses.A_BOLD,
+                )
+
+            left_w = max(36, min(46, w // 3))
+            right_x = left_w + 1
+            right_w = max(20, w - right_x - 1)
+
+            # 2. Left Column: Hardware, Weather, Network/OPSEC, Partitions
+            row = 2
+            self._safe_add(stdscr, row, 1, "┌─[ HARDWARE TELEMETRY ]───────────────┐", curses.color_pair(1) | curses.A_BOLD)
+            row += 1
+            temp_str = f"{cpu['temp_c']}°C" if cpu.get("temp_c") else "N/A"
+            self._safe_add(stdscr, row, 1, f"│ CPU: {cpu['model'][:left_w-8]}", curses.color_pair(4))
+            row += 1
+            self._safe_add(
+                stdscr,
+                row,
+                1,
+                f"│ Load: [{self._bar(cpu['usage_pct'], 12)}] {cpu['usage_pct']:>4.1f}% ({temp_str})",
+                curses.color_pair(2),
+            )
+            row += 1
+            self._safe_add(
+                stdscr,
+                row,
+                1,
+                f"│ RAM : [{self._bar(mem['pct'], 12)}] {mem['used_gb']}/{mem['total_gb']}G ({mem['pct']}%)",
+                curses.color_pair(3),
+            )
+            row += 1
+            self._safe_add(
+                stdscr,
+                row,
+                1,
+                f"│ GPU : {snap['gpu'][:left_w-9]}",
+                curses.color_pair(4),
+            )
+            row += 1
+            bat_str = f"{power['percent']}% ({power['status']})" if power["has_battery"] else power["status"]
+            self._safe_add(stdscr, row, 1, f"│ PWR : {bat_str}", curses.color_pair(4))
+            row += 1
+            for mnt in storage["mounts"][:2]:
+                self._safe_add(
+                    stdscr,
+                    row,
+                    1,
+                    f"│ DSK {mnt['mount'][:8]:<8}: {mnt['used_gb']}/{mnt['total_gb']}G ({mnt['pct']}%)",
+                    curses.color_pair(4),
+                )
+                row += 1
+
+            # Weather Panel
+            row += 1
+            self._safe_add(stdscr, row, 1, "├─[ WEATHER STATION (w=City) ]─────────┤", curses.color_pair(1) | curses.A_BOLD)
+            row += 1
+            self._safe_add(stdscr, row, 1, f"│ Loc : {wx['location'][:left_w-9]}", curses.color_pair(2) | curses.A_BOLD)
+            row += 1
+            self._safe_add(
+                stdscr,
+                row,
+                1,
+                f"│ Now : {wx['icon']} {wx['temp_c']}°C (Feels {wx['feels_like_c']}°C) {wx['condition'][:14]}",
+                curses.color_pair(3),
+            )
+            row += 1
+            self._safe_add(
+                stdscr,
+                row,
+                1,
+                f"│ Wind: {wx['wind_kmh']} km/h │ Hum: {wx['humidity']}% │ {wx['pressure_hpa']}hPa",
+                curses.color_pair(4),
+            )
+            row += 1
+            if wx.get("forecast"):
+                fc_str = " │ ".join(f"{d['date'][5:]}:{d['max_c']}°" for d in wx["forecast"][:3])
+                self._safe_add(stdscr, row, 1, f"│ 3Day: {fc_str[:left_w-9]}", curses.color_pair(4))
+                row += 1
+
+            # Network & OPSEC Panel
+            row += 1
+            self._safe_add(stdscr, row, 1, "├─[ NETWORK & OPSEC (p=Mask IP) ]──────┤", curses.color_pair(1) | curses.A_BOLD)
+            row += 1
+            if net["vpn_active"]:
+                self._safe_add(
+                    stdscr,
+                    row,
+                    1,
+                    f"│ VPN : ★ {net['vpn_iface']} ACTIVE ({net['vpn_ip']})",
+                    curses.color_pair(3) | curses.A_BOLD,
+                )
+            else:
+                self._safe_add(stdscr, row, 1, "│ VPN : ⚠ NO VPN TUNNEL (tun0/wg0 off)", curses.color_pair(5))
+            row += 1
+            for iface in net["interfaces"][:2]:
+                self._safe_add(stdscr, row, 1, f"│ NIC : {iface['iface']} -> {iface['ip']} ({iface['state']})", curses.color_pair(2))
+                row += 1
+            self._safe_add(stdscr, row, 1, f"│ Pub : {net['public_ip']}", curses.color_pair(4))
+            row += 1
+            self._safe_add(
+                stdscr,
+                row,
+                1,
+                f"│ Rate: ↓ {net['rx_kbps']} KB/s  ↑ {net['tx_kbps']} KB/s",
+                curses.color_pair(3),
+            )
+            row += 1
+            ports_str = ", ".join(net["listening_ports"][:6]) or "None"
+            self._safe_add(stdscr, row, 1, f"│ Listen: {ports_str[:left_w-11]}", curses.color_pair(4))
+            row += 1
+
+            # Top Processes
+            if row + 4 < h - 2:
+                row += 1
+                self._safe_add(stdscr, row, 1, "├─[ TOP PROCESSES ]────────────────────┤", curses.color_pair(1) | curses.A_BOLD)
+                row += 1
+                for p in procs[:3]:
+                    if row < h - 2:
+                        self._safe_add(
+                            stdscr,
+                            row,
+                            1,
+                            f"│ {p['name']:<14} PID:{p['pid']:<6} {p['cpu']:>4}% CPU",
+                            curses.color_pair(4),
+                        )
+                        row += 1
+
+            # 3. Right Column: Engagement Bar + Category Tabs + Command Menu + Console
+            self._safe_add(
+                stdscr,
+                2,
+                right_x,
+                f"┌─[ ENGAGEMENT CONTEXT (Press 't' to Set Target / LHOST) ]{'─' * max(0, right_w - 59)}┐",
+                curses.color_pair(1) | curses.A_BOLD,
+            )
+            ctx_line = (
+                f"│ TARGET: {self.cfg['target']}  │  LHOST: {self.cfg['lhost']}:{self.cfg['lport']}"
+                f"  │  IFACE: {self.cfg['interface']}  │  SEARCH(/): {self.search_query or 'All'}"
+            )
+            self._safe_add(stdscr, 3, right_x, ctx_line, curses.color_pair(2) | curses.A_BOLD)
+
+            # Category Tabs
+            tab_x = right_x
+            for idx, cat in enumerate(CATEGORIES):
+                label = f" {idx+1}:{cat.split()[0]} "
+                if tab_x + len(label) >= w - 1:
+                    break
+                attr = (
+                    curses.A_REVERSE | curses.color_pair(1) | curses.A_BOLD
+                    if idx == self.cat_idx
+                    else curses.color_pair(4)
+                )
+                self._safe_add(stdscr, 5, tab_x, label, attr)
+                tab_x += len(label) + 1
+
+            # Filtered Commands List
+            cmds = self.filtered_commands()
+            if self.cmd_idx >= len(cmds):
+                self.cmd_idx = max(0, len(cmds) - 1)
+
+            list_top = 7
+            console_h = max(7, min(11, h // 3))
+            list_h = max(4, h - list_top - console_h - 3)
+
+            self._safe_add(
+                stdscr,
+                6,
+                right_x,
+                f"├─[ COMMAND MENU: {CATEGORIES[self.cat_idx]} ({len(cmds)} commands) ]{'─' * max(0, right_w - 38)}┤",
+                curses.color_pair(1) | curses.A_BOLD,
+            )
+
+            start_idx = max(0, self.cmd_idx - list_h + 3)
+            for i in range(list_h):
+                c_i = start_idx + i
+                y = list_top + i
+                if c_i >= len(cmds):
+                    break
+                c = cmds[c_i]
+                star = "★" if c.get("favorite") else " "
+                inst = "✓" if c.get("installed") else "+"
+                line_str = f" {star} [{inst}] {c['name']:<36} │ {c['category']}"
+                if c_i == self.cmd_idx:
+                    self._safe_add(stdscr, y, right_x, line_str.ljust(right_w), curses.A_REVERSE | curses.color_pair(2) | curses.A_BOLD)
+                else:
+                    color = curses.color_pair(3) if c.get("installed") else curses.color_pair(4)
+                    self._safe_add(stdscr, y, right_x, line_str, color)
+
+            # Selected Command Detail + Output Console
+            detail_y = list_top + list_h
+            self._safe_add(
+                stdscr,
+                detail_y,
+                right_x,
+                f"├─[ SELECTED COMMAND & OUTPUT CONSOLE ]{'─' * max(0, right_w - 40)}┤",
+                curses.color_pair(1) | curses.A_BOLD,
+            )
+            if cmds:
+                sel = cmds[self.cmd_idx]
+                rendered = render_command_template(sel["cmd"], self.cfg)
+                inst_txt = "INSTALLED" if sel.get("installed") else f"NOT INSTALLED (Press 'i' -> sudo pacman -S {sel.get('package','')})"
+                self._safe_add(stdscr, detail_y + 1, right_x, f"Desc: {sel.get('description','')}", curses.color_pair(4))
+                self._safe_add(
+                    stdscr,
+                    detail_y + 2,
+                    right_x,
+                    f"Cmd : $ {rendered}  [{inst_txt}]",
+                    curses.color_pair(3) | curses.A_BOLD,
+                )
+            out_start_y = detail_y + 3
+            max_out_lines = max(1, h - out_start_y - 2)
+            for idx, oline in enumerate(self.output_lines[-max_out_lines:]):
+                self._safe_add(stdscr, out_start_y + idx, right_x, f"  {oline}", curses.color_pair(2))
+
+            # Bottom Hotkey Footer Bar
+            footer = " [Enter] Run  [x] Interactive TTY  [/] Search  [t] Set Target  [w] Weather Loc  [a] Add Cmd  [f] Fav  [i] Install Pkg  [q] Quit "
+            self._safe_add(stdscr, h - 1, 0, " " * (w - 1), curses.A_REVERSE | curses.color_pair(1))
+            self._safe_add(stdscr, h - 1, 0, footer, curses.A_REVERSE | curses.color_pair(1) | curses.A_BOLD)
+
+            stdscr.refresh()
+
+            # Handle Keyboard Input
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            elif ch in (ord("q"), ord("Q")):
+                break
+            elif ch in (curses.KEY_UP, ord("k")):
+                self.cmd_idx = max(0, self.cmd_idx - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                if cmds:
+                    self.cmd_idx = min(len(cmds) - 1, self.cmd_idx + 1)
+            elif ch in (curses.KEY_LEFT, curses.KEY_BTAB):
+                self.cat_idx = (self.cat_idx - 1) % len(CATEGORIES)
+                self.cmd_idx = 0
+            elif ch in (curses.KEY_RIGHT, 9):  # Tab
+                self.cat_idx = (self.cat_idx + 1) % len(CATEGORIES)
+                self.cmd_idx = 0
+            elif ord("1") <= ch <= ord("9"):
+                idx = ch - ord("1")
+                if idx < len(CATEGORIES):
+                    self.cat_idx = idx
+                    self.cmd_idx = 0
+            elif ch == ord("/"):
+                q = self._prompt_input(stdscr, "Search / Filter Commands (empty to clear)", self.search_query)
+                if q is not None:
+                    self.search_query = q
+                    self.cmd_idx = 0
+            elif ch in (ord("t"), ord("T")):
+                new_t = self._prompt_input(stdscr, "Set Target IP / Domain ({target})", str(self.cfg["target"]))
+                if new_t:
+                    self.cfg["target"] = new_t.strip()
+                new_lh = self._prompt_input(stdscr, "Set LHOST IP ({lhost})", str(self.cfg["lhost"]))
+                if new_lh:
+                    self.cfg["lhost"] = new_lh.strip()
+                new_lp = self._prompt_input(stdscr, "Set LPORT ({lport})", str(self.cfg["lport"]))
+                if new_lp:
+                    self.cfg["lport"] = new_lp.strip()
+                save_config(self.cfg)
+            elif ch in (ord("w"), ord("W")):
+                new_loc = self._prompt_input(stdscr, "Set Weather Location (City, Country)", str(self.cfg["location"]))
+                if new_loc:
+                    self.cfg["location"] = new_loc.strip()
+                    save_config(self.cfg)
+                    self.engine.get_weather(self.cfg, force=True)
+                    last_telemetry = 0.0
+            elif ch in (ord("p"), ord("P")):
+                self.cfg["privacy_mask_ip"] = not bool(self.cfg.get("privacy_mask_ip", False))
+                save_config(self.cfg)
+                last_telemetry = 0.0
+            elif ch in (ord("f"), ord("F")):
+                if cmds:
+                    sel = cmds[self.cmd_idx]
+                    sel["favorite"] = not bool(sel.get("favorite", False))
+                    save_commands(self.commands)
+            elif ch in (ord("a"), ord("A")):
+                name = self._prompt_input(stdscr, "New Custom Command Name", "My Custom Scan")
+                if name:
+                    cmd_t = self._prompt_input(
+                        stdscr,
+                        "Command Template (use {target}, {lhost}, {lport}, {interface})",
+                        "nmap -F {target}",
+                    )
+                    if cmd_t:
+                        desc = self._prompt_input(stdscr, "Short Description", "Custom user command") or "Custom command"
+                        bin_name = cmd_t.strip().split()[0]
+                        if bin_name == "sudo" and len(cmd_t.strip().split()) > 1:
+                            bin_name = cmd_t.strip().split()[1]
+                        new_cmd = {
+                            "id": f"custom-{int(time.time())}",
+                            "name": name.strip(),
+                            "category": "Custom",
+                            "cmd": cmd_t.strip(),
+                            "binary": bin_name,
+                            "package": bin_name,
+                            "tags": ["custom"],
+                            "favorite": True,
+                            "interactive": False,
+                            "description": desc.strip(),
+                            "installed": bool(shutil.which(bin_name)),
+                        }
+                        self.commands.insert(0, new_cmd)
+                        save_commands(self.commands)
+            elif ch in (ord("i"), ord("I")):
+                if cmds:
+                    sel = cmds[self.cmd_idx]
+                    pkg = sel.get("package") or sel.get("binary") or ""
+                    if pkg:
+                        self._run_command_interactive(stdscr, f"sudo pacman -S --needed {pkg}")
+                        self.commands = load_commands()
+            elif ch in (ord("x"), ord("X")):
+                if cmds:
+                    sel = cmds[self.cmd_idx]
+                    rendered = render_command_template(sel["cmd"], self.cfg)
+                    edited = self._prompt_input(stdscr, f"Run in Interactive Terminal: {sel['name']}", rendered)
+                    if edited:
+                        self._run_command_interactive(stdscr, edited)
+            elif ch in (10, 13, curses.KEY_ENTER, ord("r")):
+                if cmds:
+                    sel = cmds[self.cmd_idx]
+                    rendered = render_command_template(sel["cmd"], self.cfg)
+                    edited = self._prompt_input(stdscr, f"Execute Command: {sel['name']}", rendered)
+                    if edited:
+                        if sel.get("interactive"):
+                            self._run_command_interactive(stdscr, edited)
+                        else:
+                            self._run_command_capture(edited)
+
+
+# ---------------------------------------------------------------------------
+# Graphical / Web Cyberdeck UI Server (--web / --gui Mode)
+# ---------------------------------------------------------------------------
+WEB_UI_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BLACKARCH // CYBERDECK COMMAND CENTER</title>
+<style>
+  :root {
+    --bg-deep: #07090e;
+    --bg-panel: #0d111a;
+    --bg-card: #131926;
+    --bg-hover: #1b2436;
+    --crimson: #ef4444;
+    --crimson-glow: rgba(239, 68, 68, 0.28);
+    --cyan: #06b6d4;
+    --cyan-glow: rgba(6, 182, 212, 0.24);
+    --emerald: #10b981;
+    --amber: #f59e0b;
+    --text-main: #f3f4f6;
+    --text-muted: #9ca3af;
+    --border: #1f293d;
+    --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background-color: var(--bg-deep);
+    background-image:
+      radial-gradient(circle at 12% 10%, rgba(239, 68, 68, 0.09), transparent 32%),
+      radial-gradient(circle at 88% 85%, rgba(6, 182, 212, 0.08), transparent 32%),
+      linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 28px 28px, 28px 28px;
+    color: var(--text-main);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  /* Top Cyberdeck Header */
+  .top-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 12px 20px;
+    background: rgba(13, 17, 26, 0.94);
+    border-bottom: 1px solid var(--crimson);
+    box-shadow: 0 2px 20px var(--crimson-glow);
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .brand-logo {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, #ef4444, #991b1b);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 900;
+    font-size: 18px;
+    box-shadow: 0 0 12px var(--crimson-glow);
+  }
+  .brand-title {
+    font-size: 16px;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+    color: #fff;
+  }
+  .brand-sub {
+    font-size: 11px;
+    color: var(--cyan);
+  }
+  .sys-pills {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .pill {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 11.5px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .pill.vpn-ok { border-color: var(--emerald); color: var(--emerald); }
+  .pill.vpn-warn { border-color: var(--amber); color: var(--amber); }
+  .clock-box {
+    text-align: right;
+  }
+  .clock-time {
+    font-size: 22px;
+    font-weight: 800;
+    color: var(--cyan);
+    letter-spacing: 2px;
+    text-shadow: 0 0 10px var(--cyan-glow);
+  }
+  .clock-date {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  /* Main Grid */
+  .deck-grid {
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    gap: 16px;
+    padding: 16px 20px;
+    flex: 1;
+  }
+  @media (max-width: 1100px) {
+    .deck-grid { grid-template-columns: 1fr; }
+  }
+  .col-left {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .col-right {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .panel {
+    background: rgba(13, 17, 26, 0.9);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    position: relative;
+    overflow: hidden;
+  }
+  .panel::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 2px;
+    background: linear-gradient(90deg, var(--crimson), var(--cyan));
+  }
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .panel-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--crimson);
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  /* Meters & Bars */
+  .metric-row {
+    margin-bottom: 10px;
+  }
+  .metric-top {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    margin-bottom: 4px;
+  }
+  .bar-track {
+    width: 100%;
+    height: 8px;
+    background: #1a2234;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.4s ease;
+    background: linear-gradient(90deg, var(--cyan), var(--crimson));
+  }
+  .bar-fill.green { background: linear-gradient(90deg, #10b981, #06b6d4); }
+  .core-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    margin-top: 8px;
+    margin-bottom: 10px;
+  }
+  .core-chip {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font-size: 10.5px;
+    display: flex;
+    justify-content: space-between;
+  }
+  /* Weather Card */
+  .wx-main {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+  }
+  .wx-temp {
+    font-size: 28px;
+    font-weight: 800;
+    color: #fff;
+  }
+  .wx-cond {
+    font-size: 12px;
+    color: var(--cyan);
+  }
+  .wx-meta {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    font-size: 11px;
+    margin-bottom: 10px;
+  }
+  .wx-meta-box {
+    background: var(--bg-card);
+    padding: 6px 8px;
+    border-radius: 6px;
+    text-align: center;
+  }
+  .wx-forecast {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+  }
+  .wx-day {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px;
+    text-align: center;
+    font-size: 11px;
+  }
+  /* Engagement Context Bar */
+  .ctx-bar {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+  }
+  .ctx-field label {
+    display: block;
+    font-size: 10.5px;
+    color: var(--cyan);
+    margin-bottom: 3px;
+    font-weight: 700;
+  }
+  .ctx-field input {
+    width: 100%;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: #fff;
+    padding: 7px 10px;
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .ctx-field input:focus {
+    outline: none;
+    border-color: var(--crimson);
+    box-shadow: 0 0 8px var(--crimson-glow);
+  }
+  /* Category Tabs & Search */
+  .cmd-controls {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .search-input {
+    flex: 1;
+    min-width: 220px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: #fff;
+    padding: 9px 14px;
+    border-radius: 8px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+  }
+  .search-input:focus {
+    outline: none;
+    border-color: var(--cyan);
+  }
+  .btn {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-main);
+    padding: 8px 13px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    transition: all 0.15s;
+  }
+  .btn:hover {
+    border-color: var(--cyan);
+    background: var(--bg-hover);
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, #ef4444, #b91c1c);
+    border-color: #ef4444;
+    color: #fff;
+  }
+  .btn-primary:hover {
+    filter: brightness(1.12);
+    border-color: #fff;
+  }
+  .btn-cyan {
+    background: rgba(6, 182, 212, 0.15);
+    border-color: var(--cyan);
+    color: var(--cyan);
+  }
+  .cat-tabs {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .cat-tab {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: all 0.15s;
+  }
+  .cat-tab:hover {
+    color: #fff;
+    border-color: var(--cyan);
+  }
+  .cat-tab.active {
+    background: rgba(239, 68, 68, 0.18);
+    border-color: var(--crimson);
+    color: #fff;
+    font-weight: 700;
+  }
+  /* Command Cards Grid */
+  .cmd-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 12px;
+    max-height: 540px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .cmd-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 8px;
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  .cmd-card:hover {
+    border-color: var(--cyan);
+    transform: translateY(-1px);
+  }
+  .cmd-card-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .cmd-name {
+    font-weight: 700;
+    color: #fff;
+    font-size: 13px;
+  }
+  .badge {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .badge.ok { background: rgba(16, 185, 129, 0.16); color: var(--emerald); border: 1px solid rgba(16,185,129,0.4); }
+  .badge.pkg { background: rgba(245, 158, 11, 0.15); color: var(--amber); border: 1px solid rgba(245,158,11,0.4); }
+  .cmd-desc {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+  .cmd-code {
+    background: #080b11;
+    border: 1px solid #1e293b;
+    padding: 7px 9px;
+    border-radius: 6px;
+    font-size: 11.5px;
+    color: var(--cyan);
+    word-break: break-all;
+  }
+  .cmd-actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    justify-content: flex-end;
+    margin-top: 2px;
+  }
+  /* Integrated Terminal Output Console */
+  .console-box {
+    background: #05070b;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 12px;
+    font-size: 12px;
+    color: #10b981;
+    height: 220px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    font-family: var(--font-mono);
+  }
+  .console-input-bar {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .console-input-bar input {
+    flex: 1;
+    background: #080b11;
+    border: 1px solid var(--border);
+    color: var(--emerald);
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+  }
+  /* Modal */
+  .modal-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.75);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--bg-panel);
+    border: 1px solid var(--crimson);
+    border-radius: 10px;
+    width: 92%;
+    max-width: 540px;
+    padding: 20px;
+    box-shadow: 0 0 30px var(--crimson-glow);
+  }
+  .form-group { margin-bottom: 12px; }
+  .form-group label { display: block; font-size: 11.5px; color: var(--cyan); margin-bottom: 4px; }
+  .form-group input, .form-group select, .form-group textarea {
+    width: 100%;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: #fff;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+  }
+  table.mini-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11.5px;
+  }
+  table.mini-table th, table.mini-table td {
+    text-align: left;
+    padding: 4px 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  table.mini-table th { color: var(--text-muted); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<header class="top-header">
+  <div class="brand">
+    <div class="brand-logo">⚔</div>
+    <div>
+      <div class="brand-title">BLACKARCH // CYBERDECK</div>
+      <div class="brand-sub" id="hdr-os">BlackArch Linux Dual-Boot Command Center</div>
+    </div>
+  </div>
+
+  <div class="sys-pills">
+    <div class="pill" id="pill-host">🖥 Host: ...</div>
+    <div class="pill" id="pill-uptime">⏱ Uptime: ...</div>
+    <div class="pill" id="pill-rtc">🔄 RTC: ...</div>
+    <div class="pill vpn-warn" id="pill-vpn">🛡 VPN: Checking...</div>
+    <button class="btn" onclick="togglePrivacyMask()" id="btn-mask">👁 Public IP: ...</button>
+  </div>
+
+  <div class="clock-box">
+    <div class="clock-time" id="clock-time">--:--:--</div>
+    <div class="clock-date" id="clock-date">Loading date...</div>
+  </div>
+</header>
+
+<main class="deck-grid">
+  <!-- LEFT COLUMN: Hardware, Weather, Network/OPSEC, Dual-Boot Storage -->
+  <section class="col-left">
+    <!-- Weather Widget -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">⛅ Live Weather Telemetry</div>
+        <button class="btn" style="padding:3px 8px;font-size:11px;" onclick="promptWeatherCity()">📍 Change City</button>
+      </div>
+      <div class="wx-main">
+        <div>
+          <div style="font-size:12px;color:var(--text-muted);" id="wx-loc">Wheathampstead, England, GB</div>
+          <div class="wx-temp" id="wx-temp">--°C</div>
+          <div class="wx-cond" id="wx-cond">Loading...</div>
+        </div>
+        <div style="font-size:40px;" id="wx-icon">⛅</div>
+      </div>
+      <div class="wx-meta">
+        <div class="wx-meta-box">Feels Like<br><strong id="wx-feels">--°C</strong></div>
+        <div class="wx-meta-box">Wind<br><strong id="wx-wind">-- km/h</strong></div>
+        <div class="wx-meta-box">Humidity<br><strong id="wx-hum">--%</strong></div>
+      </div>
+      <div class="wx-forecast" id="wx-forecast"></div>
+    </div>
+
+    <!-- Hardware Telemetry -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">⚡ Hardware & Sensors</div>
+        <span style="font-size:11px;color:var(--cyan);" id="cpu-temp-badge">Temp: --°C</span>
+      </div>
+      <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:8px;" id="cpu-model">CPU: Detecting...</div>
+      <div class="metric-row">
+        <div class="metric-top">
+          <span>CPU Total Load</span>
+          <strong id="cpu-pct">0%</strong>
+        </div>
+        <div class="bar-track"><div class="bar-fill" id="cpu-bar" style="width:0%"></div></div>
+      </div>
+      <div class="core-grid" id="core-grid"></div>
+
+      <div class="metric-row">
+        <div class="metric-top">
+          <span>Memory (RAM)</span>
+          <strong id="ram-txt">0 / 0 GB</strong>
+        </div>
+        <div class="bar-track"><div class="bar-fill green" id="ram-bar" style="width:0%"></div></div>
+      </div>
+
+      <div class="metric-row">
+        <div class="metric-top">
+          <span>Swap Space</span>
+          <strong id="swap-txt">0 / 0 GB</strong>
+        </div>
+        <div class="bar-track"><div class="bar-fill" id="swap-bar" style="width:0%"></div></div>
+      </div>
+
+      <div style="font-size:11px;color:var(--text-muted);margin-top:8px;" id="gpu-txt">GPU: ...</div>
+      <div style="font-size:11px;color:var(--emerald);margin-top:4px;" id="pwr-txt">Power: ...</div>
+    </div>
+
+    <!-- Dual-Boot & Disk Partitions -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">💾 Dual-Boot & Storage Partitions</div>
+        <span style="font-size:10.5px;color:var(--text-muted);" id="win-badge"></span>
+      </div>
+      <div id="mounts-list"></div>
+      <div style="margin-top:8px;">
+        <table class="mini-table" id="parts-table">
+          <thead><tr><th>Device</th><th>FS</th><th>Size</th><th>Mount</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Network, Listening Ports & Top Processes -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">🌐 Network, Ports & Top Processes</div>
+        <span style="font-size:11px;color:var(--emerald);" id="net-rate">↓ 0 KB/s ↑ 0 KB/s</span>
+      </div>
+      <div id="ifaces-list" style="margin-bottom:8px;font-size:11.5px;"></div>
+      <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">
+        Listening TCP Ports: <strong style="color:var(--cyan);" id="listen-ports">None</strong>
+      </div>
+      <table class="mini-table" id="procs-table">
+        <thead><tr><th>Process</th><th>PID</th><th>CPU%</th><th>MEM%</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- RIGHT COLUMN: Engagement Context, Command Menu & Integrated Console -->
+  <section class="col-right">
+    <!-- Engagement Variables Bar -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">🎯 Engagement & Target Context Variables (Live Command Interpolation)</div>
+        <button class="btn btn-cyan" style="padding:4px 10px;font-size:11px;" onclick="saveContextVars()">💾 Save Context</button>
+      </div>
+      <div class="ctx-bar">
+        <div class="ctx-field">
+          <label>TARGET IP / DOMAIN ({target})</label>
+          <input type="text" id="ctx-target" value="10.10.11.24" oninput="renderCommands()" />
+        </div>
+        <div class="ctx-field">
+          <label>LHOST / TUNNEL IP ({lhost})</label>
+          <input type="text" id="ctx-lhost" value="127.0.0.1" oninput="renderCommands()" />
+        </div>
+        <div class="ctx-field">
+          <label>LPORT ({lport})</label>
+          <input type="text" id="ctx-lport" value="4444" oninput="renderCommands()" />
+        </div>
+        <div class="ctx-field">
+          <label>INTERFACE ({interface})</label>
+          <input type="text" id="ctx-iface" value="eth0" oninput="renderCommands()" />
+        </div>
+        <div class="ctx-field">
+          <label>WORDLIST PATH ({wordlist})</label>
+          <input type="text" id="ctx-wordlist" value="/usr/share/wordlists/rockyou.txt" oninput="renderCommands()" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Menu-Driven Command Center -->
+    <div class="panel" style="flex:1;">
+      <div class="panel-header">
+        <div class="panel-title">⚡ Menu-Driven Command Center (<span id="cmd-count">0</span> Commands)</div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn" onclick="toggleInstalledOnly()" id="btn-inst-filter">Filter: All Tools</button>
+          <button class="btn btn-primary" onclick="openAddModal()">+ Add Custom Command</button>
+        </div>
+      </div>
+
+      <div class="cmd-controls">
+        <input type="text" class="search-input" id="cmd-search" placeholder="🔍 Search commands by tool, name, description, or tag (e.g. nmap, wifi, ntfs, grub, hashcat, vpn)..." oninput="renderCommands()" />
+      </div>
+
+      <div class="cat-tabs" id="cat-tabs"></div>
+      <div class="cmd-grid" id="cmd-grid"></div>
+    </div>
+
+    <!-- Integrated Cyberdeck Output Console -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">💻 Integrated Cyberdeck Command Console</div>
+        <button class="btn" style="padding:3px 8px;font-size:11px;" onclick="clearConsole()">Clear Output</button>
+      </div>
+      <div class="console-box" id="console-output">[BLACKARCH CYBERDECK READY]
+Select any command card above and click [▶ Execute] to run it here, or [📋 Copy] to paste into another terminal.</div>
+      <div class="console-input-bar">
+        <input type="text" id="console-cmd-input" placeholder="Run custom shell command or edit selected command..." onkeydown="if(event.key==='Enter') runConsoleInput()" />
+        <button class="btn btn-primary" onclick="runConsoleInput()">▶ Run Command</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- Modal for Adding / Editing Custom Command -->
+<div class="modal-backdrop" id="cmd-modal">
+  <div class="modal">
+    <div class="panel-header">
+      <div class="panel-title" id="modal-title">+ Add Custom Command</div>
+      <button class="btn" onclick="closeModal()">✕</button>
+    </div>
+    <input type="hidden" id="m-id" value="" />
+    <div class="form-group">
+      <label>Command Title</label>
+      <input type="text" id="m-name" placeholder="e.g. Nmap Vulners Scan" />
+    </div>
+    <div class="form-group">
+      <label>Category</label>
+      <select id="m-cat">
+        <option value="Custom">Custom</option>
+        <option value="Recon & OSINT">Recon & OSINT</option>
+        <option value="Web & API">Web & API</option>
+        <option value="Wi-Fi & Network">Wi-Fi & Network</option>
+        <option value="Exploit & Passwords">Exploit & Passwords</option>
+        <option value="Forensics & RE">Forensics & RE</option>
+        <option value="OPSEC & VPN">OPSEC & VPN</option>
+        <option value="Dual-Boot & System">Dual-Boot & System</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Command Template (Supports {target}, {lhost}, {lport}, {interface}, {wordlist})</label>
+      <input type="text" id="m-cmd" placeholder="nmap -sV --script vulners {target}" />
+    </div>
+    <div class="form-group">
+      <label>Binary / Pacman Package Name</label>
+      <input type="text" id="m-pkg" placeholder="nmap" />
+    </div>
+    <div class="form-group">
+      <label>Description & Usage Notes</label>
+      <textarea id="m-desc" rows="2" placeholder="What does this command do?"></textarea>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitCustomCommand()">Save Command</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const CATEGORIES = [
+  "★ Favorites",
+  "All Commands",
+  "Recon & OSINT",
+  "Web & API",
+  "Wi-Fi & Network",
+  "Exploit & Passwords",
+  "Forensics & RE",
+  "OPSEC & VPN",
+  "Dual-Boot & System",
+  "Custom"
+];
+
+let activeCategory = "All Commands";
+let installedOnly = false;
+let allCommands = [];
+let currentConfig = {};
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function interpolateCmd(template) {
+  const t = document.getElementById("ctx-target").value || "127.0.0.1";
+  const lh = document.getElementById("ctx-lhost").value || "127.0.0.1";
+  const lp = document.getElementById("ctx-lport").value || "4444";
+  const iface = document.getElementById("ctx-iface").value || "eth0";
+  const wl = document.getElementById("ctx-wordlist").value || "/usr/share/wordlists/rockyou.txt";
+  return String(template || "")
+    .replace(/\{target\}/g, t)
+    .replace(/\{lhost\}/g, lh)
+    .replace(/\{lport\}/g, lp)
+    .replace(/\{interface\}/g, iface)
+    .replace(/\{wordlist\}/g, wl);
+}
+
+function renderCategoryTabs() {
+  const wrap = document.getElementById("cat-tabs");
+  wrap.innerHTML = CATEGORIES.map(cat => {
+    const cls = cat === activeCategory ? "cat-tab active" : "cat-tab";
+    return `<button class="${cls}" onclick="selectCategory('${escapeHtml(cat)}')">${escapeHtml(cat)}</button>`;
+  }).join("");
+}
+
+function selectCategory(cat) {
+  activeCategory = cat;
+  renderCategoryTabs();
+  renderCommands();
+}
+
+function toggleInstalledOnly() {
+  installedOnly = !installedOnly;
+  document.getElementById("btn-inst-filter").textContent = installedOnly ? "Filter: Installed Only ✓" : "Filter: All Tools";
+  renderCommands();
+}
+
+function renderCommands() {
+  const q = (document.getElementById("cmd-search").value || "").toLowerCase().trim();
+  const filtered = allCommands.filter(c => {
+    if (activeCategory === "★ Favorites" && !c.favorite) return false;
+    if (activeCategory !== "★ Favorites" && activeCategory !== "All Commands" && c.category !== activeCategory) return false;
+    if (installedOnly && !c.installed) return false;
+    if (q) {
+      const hay = `${c.name} ${c.cmd} ${c.description} ${(c.tags || []).join(" ")} ${c.category}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  document.getElementById("cmd-count").textContent = filtered.length;
+  const grid = document.getElementById("cmd-grid");
+  grid.innerHTML = filtered.map(c => {
+    const rendered = interpolateCmd(c.cmd);
+    const badge = c.installed
+      ? `<span class="badge ok">✓ INSTALLED</span>`
+      : `<span class="badge pkg">📦 pacman -S ${escapeHtml(c.package || c.binary)}</span>`;
+    const star = c.favorite ? "★" : "☆";
+    return `
+      <div class="cmd-card">
+        <div>
+          <div class="cmd-card-top">
+            <div class="cmd-name">${escapeHtml(c.name)}</div>
+            ${badge}
+          </div>
+          <div style="font-size:10.5px;color:var(--crimson);margin:3px 0;">${escapeHtml(c.category)}</div>
+          <div class="cmd-desc">${escapeHtml(c.description)}</div>
+        </div>
+        <div>
+          <div class="cmd-code">$ ${escapeHtml(rendered)}</div>
+          <div class="cmd-actions">
+            <button class="btn" title="Toggle Favorite" onclick="toggleFavorite('${escapeHtml(c.id)}')">${star}</button>
+            <button class="btn" onclick="copyCmd('${escapeHtml(c.id)}')">📋 Copy</button>
+            <button class="btn" onclick="editCmd('${escapeHtml(c.id)}')">✎ Edit</button>
+            ${c.category === 'Custom' ? `<button class="btn" onclick="deleteCmd('${escapeHtml(c.id)}')">🗑</button>` : ''}
+            <button class="btn btn-primary" onclick="executeCardCmd('${escapeHtml(c.id)}')">▶ Execute</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+async function fetchInitialData() {
+  renderCategoryTabs();
+  const [cfgRes, cmdRes] = await Promise.all([
+    fetch("/api/config"),
+    fetch("/api/commands")
+  ]);
+  currentConfig = await cfgRes.json();
+  allCommands = await cmdRes.json();
+
+  document.getElementById("ctx-target").value = currentConfig.target || "10.10.11.24";
+  document.getElementById("ctx-lhost").value = currentConfig.lhost || "127.0.0.1";
+  document.getElementById("ctx-lport").value = currentConfig.lport || "4444";
+  document.getElementById("ctx-iface").value = currentConfig.interface || "eth0";
+  document.getElementById("ctx-wordlist").value = currentConfig.wordlist || "/usr/share/wordlists/rockyou.txt";
+
+  renderCommands();
+  refreshTelemetry();
+}
+
+async function refreshTelemetry() {
+  try {
+    const res = await fetch("/api/telemetry");
+    const d = await res.json();
+
+    // Header & Clock
+    document.getElementById("clock-time").textContent = d.system.time;
+    document.getElementById("clock-date").textContent = `${d.system.date} (${d.system.timezone})`;
+    document.getElementById("hdr-os").textContent = `${d.system.os} • Kernel ${d.system.kernel} • Load ${d.system.load_avg}`;
+    document.getElementById("pill-host").textContent = `🖥 ${d.system.hostname}`;
+    document.getElementById("pill-uptime").textContent = `⏱ Up: ${d.system.uptime}`;
+    document.getElementById("pill-rtc").textContent = `🔄 RTC: ${d.storage.rtc_mode}`;
+
+    const vpnPill = document.getElementById("pill-vpn");
+    if (d.network.vpn_active) {
+      vpnPill.className = "pill vpn-ok";
+      vpnPill.textContent = `🛡 VPN (${d.network.vpn_iface}): ${d.network.vpn_ip}`;
+    } else {
+      vpnPill.className = "pill vpn-warn";
+      vpnPill.textContent = `⚠ VPN: Disconnected`;
+    }
+    document.getElementById("btn-mask").textContent = `👁 Pub IP: ${d.network.public_ip}`;
+
+    // Weather
+    const wx = d.weather;
+    document.getElementById("wx-loc").textContent = `${wx.location} (${wx.source})`;
+    document.getElementById("wx-temp").textContent = `${wx.temp_c}°C`;
+    document.getElementById("wx-cond").textContent = wx.condition;
+    document.getElementById("wx-icon").textContent = wx.icon || "⛅";
+    document.getElementById("wx-feels").textContent = `${wx.feels_like_c}°C`;
+    document.getElementById("wx-wind").textContent = `${wx.wind_kmh} km/h`;
+    document.getElementById("wx-hum").textContent = `${wx.humidity}%`;
+    document.getElementById("wx-forecast").innerHTML = (wx.forecast || []).map(f => `
+      <div class="wx-day">
+        <div style="color:var(--text-muted);">${escapeHtml(f.date.slice(5))}</div>
+        <div style="font-size:16px;margin:2px 0;">${escapeHtml(f.icon)}</div>
+        <div><strong>${f.max_c}°</strong> / ${f.min_c}°</div>
+      </div>
+    `).join("");
+
+    // Hardware
+    document.getElementById("cpu-model").textContent = `${d.cpu.model} (${d.cpu.cores} Threads @ ${d.cpu.freq_mhz} MHz)`;
+    document.getElementById("cpu-temp-badge").textContent = d.cpu.temp_c ? `🌡 ${d.cpu.temp_c}°C` : "🌡 Sensor Ready";
+    document.getElementById("cpu-pct").textContent = `${d.cpu.usage_pct}%`;
+    document.getElementById("cpu-bar").style.width = `${d.cpu.usage_pct}%`;
+    document.getElementById("core-grid").innerHTML = (d.cpu.per_core || []).slice(0, 8).map((pct, i) => `
+      <div class="core-chip"><span>C${i}</span><strong style="color:var(--cyan);">${pct}%</strong></div>
+    `).join("");
+
+    document.getElementById("ram-txt").textContent = `${d.memory.used_gb} / ${d.memory.total_gb} GB (${d.memory.pct}%)`;
+    document.getElementById("ram-bar").style.width = `${d.memory.pct}%`;
+    document.getElementById("swap-txt").textContent = `${d.memory.swap_used_gb} / ${d.memory.swap_total_gb} GB (${d.memory.swap_pct}%)`;
+    document.getElementById("swap-bar").style.width = `${d.memory.swap_pct}%`;
+    document.getElementById("gpu-txt").textContent = `GPU: ${d.gpu}`;
+    document.getElementById("pwr-txt").textContent = `Power: ${d.power.status} (${d.power.percent}%)`;
+
+    // Storage & Dual-Boot
+    document.getElementById("win-badge").textContent = d.storage.windows_detected ? "🪟 Windows NTFS Detected" : "Linux Partition Layout";
+    document.getElementById("mounts-list").innerHTML = (d.storage.mounts || []).map(m => `
+      <div class="metric-row">
+        <div class="metric-top"><span>Mount <strong>${escapeHtml(m.mount)}</strong></span><span>${m.used_gb} / ${m.total_gb} GB (${m.pct}%)</span></div>
+        <div class="bar-track"><div class="bar-fill green" style="width:${m.pct}%"></div></div>
+      </div>
+    `).join("");
+
+    document.querySelector("#parts-table tbody").innerHTML = (d.storage.partitions || []).map(p => `
+      <tr>
+        <td>${escapeHtml(p.name)}</td>
+        <td><span class="badge ok">${escapeHtml(p.fstype)}</span></td>
+        <td>${escapeHtml(p.size)}</td>
+        <td>${escapeHtml(p.mountpoint)}</td>
+      </tr>
+    `).join("");
+
+    // Network & Processes
+    document.getElementById("net-rate").textContent = `↓ ${d.network.rx_kbps} KB/s  ↑ ${d.network.tx_kbps} KB/s`;
+    document.getElementById("ifaces-list").innerHTML = (d.network.interfaces || []).map(n =>
+      `<div>🔌 <strong>${escapeHtml(n.iface)}</strong>: <span style="color:var(--cyan);">${escapeHtml(n.ip)}</span> (${escapeHtml(n.state)})</div>`
+    ).join("");
+    document.getElementById("listen-ports").textContent = (d.network.listening_ports || []).join(", ") || "None";
+
+    document.querySelector("#procs-table tbody").innerHTML = (d.processes || []).map(p => `
+      <tr>
+        <td>${escapeHtml(p.name)}</td>
+        <td>${escapeHtml(p.pid)}</td>
+        <td style="color:var(--crimson);">${escapeHtml(p.cpu)}%</td>
+        <td>${escapeHtml(p.mem)}%</td>
+      </tr>
+    `).join("");
+  } catch (e) {
+    console.error("Telemetry error:", e);
+  }
+}
+
+async function saveContextVars() {
+  const payload = {
+    target: document.getElementById("ctx-target").value,
+    lhost: document.getElementById("ctx-lhost").value,
+    lport: document.getElementById("ctx-lport").value,
+    interface: document.getElementById("ctx-iface").value,
+    wordlist: document.getElementById("ctx-wordlist").value
+  };
+  await fetch("/api/config", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+}
+
+async function promptWeatherCity() {
+  const city = prompt("Enter your City / Location for Live Weather:", currentConfig.location || "Wheathampstead, England, GB");
+  if (!city) return;
+  currentConfig.location = city;
+  await fetch("/api/config", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({location: city, refresh_weather: true})
+  });
+  refreshTelemetry();
+}
+
+async function togglePrivacyMask() {
+  currentConfig.privacy_mask_ip = !currentConfig.privacy_mask_ip;
+  await fetch("/api/config", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({privacy_mask_ip: currentConfig.privacy_mask_ip})
+  });
+  refreshTelemetry();
+}
+
+function findCmd(id) {
+  return allCommands.find(c => c.id === id);
+}
+
+function copyCmd(id) {
+  const c = findCmd(id);
+  if (!c) return;
+  const rendered = interpolateCmd(c.cmd);
+  navigator.clipboard.writeText(rendered);
+  const out = document.getElementById("console-output");
+  out.textContent += `\n[COPIED TO CLIPBOARD] $ ${rendered}\n`;
+  out.scrollTop = out.scrollHeight;
+}
+
+async function executeCardCmd(id) {
+  const c = findCmd(id);
+  if (!c) return;
+  const rendered = interpolateCmd(c.cmd);
+  document.getElementById("console-cmd-input").value = rendered;
+  await executeShellCommand(rendered);
+}
+
+async function runConsoleInput() {
+  const cmd = document.getElementById("console-cmd-input").value.trim();
+  if (!cmd) return;
+  await executeShellCommand(cmd);
+}
+
+async function executeShellCommand(cmd) {
+  const out = document.getElementById("console-output");
+  out.textContent += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n$ ${cmd}\n[Running...]\n`;
+  out.scrollTop = out.scrollHeight;
+  const res = await fetch("/api/execute", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({cmd})
+  });
+  const data = await res.json();
+  out.textContent += `${data.output || "(no output)"}\n[Exit Code: ${data.exit_code}]\n`;
+  out.scrollTop = out.scrollHeight;
+}
+
+function clearConsole() {
+  document.getElementById("console-output").textContent = "[CONSOLE CLEARED]\n";
+}
+
+async function toggleFavorite(id) {
+  const c = findCmd(id);
+  if (!c) return;
+  c.favorite = !c.favorite;
+  await fetch("/api/commands", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "save_all", commands: allCommands})
+  });
+  renderCommands();
+}
+
+function openAddModal() {
+  document.getElementById("modal-title").textContent = "+ Add Custom Command";
+  document.getElementById("m-id").value = "";
+  document.getElementById("m-name").value = "";
+  document.getElementById("m-cat").value = "Custom";
+  document.getElementById("m-cmd").value = "";
+  document.getElementById("m-pkg").value = "";
+  document.getElementById("m-desc").value = "";
+  document.getElementById("cmd-modal").classList.add("open");
+}
+
+function editCmd(id) {
+  const c = findCmd(id);
+  if (!c) return;
+  document.getElementById("modal-title").textContent = "✎ Edit Command";
+  document.getElementById("m-id").value = c.id;
+  document.getElementById("m-name").value = c.name;
+  document.getElementById("m-cat").value = c.category;
+  document.getElementById("m-cmd").value = c.cmd;
+  document.getElementById("m-pkg").value = c.package || c.binary || "";
+  document.getElementById("m-desc").value = c.description || "";
+  document.getElementById("cmd-modal").classList.add("open");
+}
+
+function closeModal() {
+  document.getElementById("cmd-modal").classList.remove("open");
+}
+
+async function submitCustomCommand() {
+  const id = document.getElementById("m-id").value || `custom-${Date.now()}`;
+  const name = document.getElementById("m-name").value.trim();
+  const category = document.getElementById("m-cat").value;
+  const cmd = document.getElementById("m-cmd").value.trim();
+  const pkg = document.getElementById("m-pkg").value.trim() || cmd.split(" ")[0];
+  const description = document.getElementById("m-desc").value.trim() || "Custom command";
+  if (!name || !cmd) {
+    alert("Please provide both a Command Title and Command Template.");
+    return;
+  }
+  const existingIdx = allCommands.findIndex(x => x.id === id);
+  const item = {
+    id, name, category, cmd,
+    binary: pkg, package: pkg,
+    tags: ["custom"],
+    favorite: existingIdx >= 0 ? allCommands[existingIdx].favorite : true,
+    interactive: false,
+    description
+  };
+  if (existingIdx >= 0) {
+    allCommands[existingIdx] = item;
+  } else {
+    allCommands.unshift(item);
+  }
+  const res = await fetch("/api/commands", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "save_all", commands: allCommands})
+  });
+  allCommands = await res.json();
+  closeModal();
+  renderCommands();
+}
+
+async function deleteCmd(id) {
+  if (!confirm("Delete this custom command?")) return;
+  allCommands = allCommands.filter(c => c.id !== id);
+  const res = await fetch("/api/commands", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({action: "save_all", commands: allCommands})
+  });
+  allCommands = await res.json();
+  renderCommands();
+}
+
+fetchInitialData();
+setInterval(refreshTelemetry, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+class CyberdeckHTTPHandler(http.server.BaseHTTPRequestHandler):
+    engine: TelemetryEngine = TelemetryEngine()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return  # Keep console clean
+
+    def _send_json(self, data: Any, status: int = 200) -> None:
+        raw = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            raw = WEB_UI_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        elif parsed.path == "/api/telemetry":
+            cfg = load_config()
+            self._send_json(self.engine.collect_all(cfg))
+        elif parsed.path == "/api/config":
+            self._send_json(load_config())
+        elif parsed.path == "/api/commands":
+            self._send_json(load_commands())
+        else:
+            self._send_json({"error": "Not found"}, status=404)
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {}
+
+        if parsed.path == "/api/config":
+            cfg = load_config()
+            refresh_wx = bool(payload.pop("refresh_weather", False))
+            cfg.update(payload)
+            save_config(cfg)
+            if refresh_wx:
+                self.engine.get_weather(cfg, force=True)
+            self._send_json(cfg)
+        elif parsed.path == "/api/commands":
+            if payload.get("action") == "save_all" and isinstance(payload.get("commands"), list):
+                save_commands(payload["commands"])
+            self._send_json(load_commands())
+        elif parsed.path == "/api/execute":
+            cmd_str = str(payload.get("cmd", "")).strip()
+            if not cmd_str:
+                self._send_json({"output": "No command specified.", "exit_code": 1})
+                return
+            try:
+                proc = subprocess.Popen(
+                    cmd_str,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                out, _ = proc.communicate(timeout=20)
+                self._send_json({"output": out, "exit_code": proc.returncode})
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                self._send_json(
+                    {
+                        "output": "[Command timed out after 20s in web console. Run interactive tools in a terminal window.]",
+                        "exit_code": 124,
+                    }
+                )
+            except Exception as exc:
+                self._send_json({"output": f"Execution error: {exc}", "exit_code": 1})
+        else:
+            self._send_json({"error": "Not found"}, status=404)
+
+
+def run_web_server(host: str, port: int, open_gui: bool = False) -> None:
+    ensure_config_files()
+    server = http.server.ThreadingHTTPServer((host, port), CyberdeckHTTPHandler)
+    url = f"http://127.0.0.1:{port}"
+    print(f"\033[1;31m[BLACKARCH CYBERDECK]\033[0m Graphical/Web Command Center listening on \033[1;36mhttp://{host}:{port}\033[0m")
+    if open_gui and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        for browser in ("chromium", "google-chrome-stable", "brave", "firefox", "xdg-open"):
+            if shutil.which(browser):
+                try:
+                    if browser in ("chromium", "google-chrome-stable", "brave"):
+                        subprocess.Popen([browser, f"--app={url}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        subprocess.Popen([browser, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    break
+                except Exception:
+                    pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down BlackArch Cyberdeck Web UI.")
+
+
+# ---------------------------------------------------------------------------
+# CLI Status Snapshot (--status Mode)
+# ---------------------------------------------------------------------------
+def print_cli_status() -> None:
+    engine = TelemetryEngine()
+    time.sleep(0.15)
+    cfg = load_config()
+    cmds = load_commands()
+    snap = engine.collect_all(cfg)
+    sys_i = snap["system"]
+    cpu = snap["cpu"]
+    mem = snap["memory"]
+    wx = snap["weather"]
+    net = snap["network"]
+    st = snap["storage"]
+
+    installed_cnt = sum(1 for c in cmds if c.get("installed"))
+
+    print("\033[1;31m╔══════════════════════════════════════════════════════════════════════════════╗\033[0m")
+    print("\033[1;31m║                   ⚔  BLACKARCH // CYBERDECK TELEMETRY  ⚔                     ║\033[0m")
+    print("\033[1;31m╠══════════════════════════════════════════════════════════════════════════════╣\033[0m")
+    print(f"\033[1;31m║\033[0m \033[1;36mTime & Date :\033[0m {sys_i['time']}  {sys_i['date']} ({sys_i['timezone']})")
+    print(f"\033[1;31m║\033[0m \033[1;36mHost & OS   :\033[0m {sys_i['hostname']} • {sys_i['os']} ({sys_i['kernel']}) • Up {sys_i['uptime']}")
+    print(f"\033[1;31m║\033[0m \033[1;36mWeather     :\033[0m {wx['location']} -> {wx['icon']} {wx['temp_c']}°C (Feels {wx['feels_like_c']}°C), {wx['condition']}, Wind {wx['wind_kmh']}km/h")
+    print(f"\033[1;31m║\033[0m \033[1;36mCPU & Temp  :\033[0m {cpu['model']} ({cpu['cores']} cores) @ {cpu['usage_pct']}% load | Temp: {cpu['temp_c'] or 'N/A'}°C")
+    print(f"\033[1;31m║\033[0m \033[1;36mMemory      :\033[0m RAM {mem['used_gb']}/{mem['total_gb']} GB ({mem['pct']}%) | Swap {mem['swap_used_gb']}/{mem['swap_total_gb']} GB")
+    print(f"\033[1;31m║\033[0m \033[1;36mGPU         :\033[0m {snap['gpu']}")
+    print(f"\033[1;31m║\033[0m \033[1;36mDual-Boot   :\033[0m RTC Mode: {st['rtc_mode']} | Mounts: {', '.join(m['mount'] + ' (' + str(m['pct']) + '%)' for m in st['mounts'])}")
+    vpn_txt = f"ACTIVE ({net['vpn_iface']}: {net['vpn_ip']})" if net["vpn_active"] else "DISCONNECTED"
+    print(f"\033[1;31m║\033[0m \033[1;36mNetwork/VPN :\033[0m VPN: {vpn_txt} | Listening Ports: {', '.join(net['listening_ports']) or 'None'}")
+    print(f"\033[1;31m║\033[0m \033[1;36mEngagement  :\033[0m TARGET={cfg['target']} | LHOST={cfg['lhost']}:{cfg['lport']} | IFACE={cfg['interface']}")
+    print(f"\033[1;31m║\033[0m \033[1;36mCommand Menu:\033[0m {len(cmds)} commands across {len(CATEGORIES)-2} categories ({installed_cnt} binaries currently installed)")
+    print("\033[1;31m╚══════════════════════════════════════════════════════════════════════════════╝\033[0m")
+    print("Run \033[1;32m./blackarch-deck\033[0m for Terminal TUI or \033[1;32m./blackarch-deck --web\033[0m for Graphical Cyberdeck UI.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="BlackArch Cyberdeck UI & Menu-Driven Command Center"
+    )
+    parser.add_argument("--tui", action="store_true", help="Launch Terminal Curses Cyberdeck UI (default)")
+    parser.add_argument("--web", action="store_true", help="Launch Graphical/Web Cyberdeck UI server")
+    parser.add_argument("--gui", action="store_true", help="Launch Web UI server and open desktop app window")
+    parser.add_argument("--status", action="store_true", help="Print CLI telemetry & command summary")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind host for --web/--gui mode (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8080, help="Port for --web/--gui mode (default: 8080)")
+    parser.add_argument("--location", help="Set default weather location (e.g. 'Wheathampstead, England, GB')")
+    parser.add_argument("--target", help="Set default engagement target IP/domain")
+    args = parser.parse_args()
+
+    ensure_config_files()
+    if args.location or args.target:
+        cfg = load_config()
+        if args.location:
+            cfg["location"] = args.location
+        if args.target:
+            cfg["target"] = args.target
+        save_config(cfg)
+
+    if args.status:
+        print_cli_status()
+    elif args.web or args.gui:
+        run_web_server(args.host, args.port, open_gui=args.gui)
+    else:
+        engine = TelemetryEngine()
+        tui = CyberdeckTUI(engine)
+        curses.wrapper(tui.run)
+
+
+if __name__ == "__main__":
+    main()
