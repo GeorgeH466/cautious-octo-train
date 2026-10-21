@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# cyberdeck-netdaemon — lightweight network watchdog (started by i3 exec)
+# Logs gateway MAC changes & new listening ports every 60s to ~/.cyberdeck/logs/netdaemon.log
+set -uo pipefail
+LOG="$HOME/.cyberdeck/logs/netdaemon.log"; mkdir -p "$(dirname "$LOG")"
+echo "[$(date '+%F %T')] netdaemon started (pid $$)" >>"$LOG"
+gw_mac() { ip neigh show "$(ip route show default | awk 'NR==1{print $3}')" 2>/dev/null | awk '{print $5}'; }
+ports() { ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | paste -sd, -; }
+PREV_GW="$(gw_mac)"; PREV_PORTS="$(ports)"
+trap 'echo "[$(date "+%F %T")] netdaemon stopped" >>"$LOG"; exit 0' TERM INT
+while true; do
+  sleep 60
+  GW="$(gw_mac)"; PT="$(ports)"
+  if [[ -n "$GW" && "$GW" != "$PREV_GW" && -n "$PREV_GW" ]]; then
+    echo "[$(date '+%F %T')] ▲ GATEWAY MAC CHANGED: $PREV_GW -> $GW (possible ARP spoof — run arp-spoof-detect)" >>"$LOG"
+    command -v notify-send >/dev/null && notify-send -u critical "Cyberdeck ▲ ARP" "Gateway MAC changed: $GW" || true
+    PREV_GW="$GW"
+  fi
+  if [[ "$PT" != "$PREV_PORTS" ]]; then echo "[$(date '+%F %T')] listening ports changed: [$PREV_PORTS] -> [$PT]" >>"$LOG"; PREV_PORTS="$PT"; fi
+done

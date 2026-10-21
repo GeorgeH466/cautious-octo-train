@@ -1,0 +1,5 @@
+{
+  "name": "ghost",
+  "background": "#0a0a0a", "foreground": "#e6ffff", "primary": "#00fff5",
+  "secondary": "#00b8b0", "accent": "#7dfff8", "muted": "#3d7a78", "warn": "#ffb000", "alert": "#ff0040"
+}

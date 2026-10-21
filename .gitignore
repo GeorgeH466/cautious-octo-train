@@ -1,0 +1,13 @@
+# Cyberdeck runtime data — never commit
+.cyberdeck/
+api-keys
+*.pcap
+*.cap
+__pycache__/
+*.pyc
+.venv/
+venv/
+# Installer/test artefacts
+.gen*.py
+*.log
+.DS_Store

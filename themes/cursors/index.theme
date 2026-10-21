@@ -1,0 +1,4 @@
+[Icon Theme]
+Name=Cyberdeck Cursors
+Comment=Sci-fi cursor theme slot — inherits Capitaine until custom Xcursor frames are generated (see README.md in this directory)
+Inherits=capitaine-cursors,Adwaita

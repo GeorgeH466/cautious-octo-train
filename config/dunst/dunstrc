@@ -1,0 +1,81 @@
+# CYBERDECK // Dunst — sci-fi transmission alerts
+[global]
+    monitor = 0
+    follow = mouse
+    width = (320, 440)
+    height = 160
+    origin = top-right
+    offset = (14, 38)
+    scale = 0
+    notification_limit = 6
+    progress_bar = true
+    progress_bar_height = 3
+    progress_bar_frame_width = 1
+    progress_bar_corner_radius = 2
+    indicate_hidden = yes
+    transparency = 8
+    separator_height = 1
+    padding = 12
+    horizontal_padding = 14
+    text_icon_padding = 10
+    frame_width = 1
+    frame_color = "#1a2a2a"
+    gap_size = 6
+    separator_color = frame
+    sort = yes
+    font = JetBrainsMono Nerd Font 10
+    line_height = 2
+    markup = full
+    format = "<b>%s</b>\n%b"
+    alignment = left
+    vertical_alignment = center
+    show_age_threshold = 60
+    ellipsize = end
+    ignore_newline = no
+    stack_duplicates = true
+    hide_duplicate_count = false
+    show_indicators = yes
+    icon_position = left
+    min_icon_size = 24
+    max_icon_size = 48
+    icon_path = /usr/share/icons/Papirus-Dark/48x48/status/:/usr/share/icons/Papirus-Dark/48x48/apps/
+    sticky_history = yes
+    history_length = 20
+    browser = /usr/bin/firefox -new-tab
+    always_run_script = true
+    title = Dunst
+    class = Dunst
+    corner_radius = 8
+    ignore_dbusclose = false
+    mouse_left_click = do_action, close_current
+    mouse_middle_click = do_action
+    mouse_right_click = close_current
+
+[experimental]
+    per_monitor_dpi = false
+
+[urgency_low]
+    background = "#0a0a0af2"
+    foreground = "#5a7a78"
+    frame_color = "#1a2a2a"
+    timeout = 4
+
+[urgency_normal]
+    background = "#0a0a0af2"
+    foreground = "#e6ffff"
+    frame_color = "#00b8b0"
+    highlight = "#00fff5"
+    timeout = 7
+
+[urgency_critical]
+    background = "#17040af5"
+    foreground = "#ffd6dd"
+    frame_color = "#ff0040"
+    highlight = "#ff0040"
+    timeout = 0
+
+# Cyberdeck watchdog alerts get the red treatment + sound hook placeholder
+[cyberdeck-alert]
+    appname = "Cyberdeck*"
+    frame_color = "#ffb000"
+    highlight = "#ffb000"

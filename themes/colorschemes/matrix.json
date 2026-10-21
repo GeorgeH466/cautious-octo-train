@@ -1,0 +1,5 @@
+{
+  "name": "matrix",
+  "background": "#0a0a0a", "foreground": "#c8ffd4", "primary": "#00ff41",
+  "secondary": "#00cc33", "accent": "#7dff9a", "muted": "#3d7a4d", "warn": "#ffb000", "alert": "#ff0040"
+}

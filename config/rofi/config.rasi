@@ -1,0 +1,74 @@
+/* CYBERDECK // Rofi — command terminal overlay */
+configuration {
+  modi: "drun,run,window,ssh";
+  show-icons: true;
+  icon-theme: "Papirus-Dark";
+  terminal: "alacritty";
+  drun-display-format: "{icon} {name}";
+  display-drun: "◢ EXEC";
+  display-run: "◢ RUN";
+  display-window: "◢ WIN";
+  display-ssh: "◢ SSH";
+  sidebar-mode: true;
+  font: "JetBrainsMono Nerd Font 12";
+  lines: 12;
+  columns: 1;
+  case-sensitive: false;
+  cycle: true;
+  kb-mode-next: "Tab";
+}
+
+* {
+  bg: rgba(10, 10, 10, 92%);
+  bg-alt: rgba(13, 21, 21, 95%);
+  fg: #e6ffff;
+  primary: #00fff5;
+  secondary: #00b8b0;
+  muted: #3d7a78;
+  alert: #ff0040;
+  amber: #ffb000;
+  border-col: #1a2a2a;
+  selected: rgba(0, 255, 245, 14%);
+  background-color: transparent;
+  text-color: @fg;
+}
+
+window {
+  transparency: "real";
+  location: center;
+  anchor: center;
+  fullscreen: false;
+  width: 760px;
+  border: 1px;
+  border-color: @primary;
+  border-radius: 8px;
+  background-color: @bg;
+}
+
+mainbox { children: [inputbar, message, listview, mode-switcher]; }
+
+inputbar {
+  children: [prompt, entry];
+  padding: 14px 16px;
+  border: 0 0 1px 0;
+  border-color: @border-col;
+}
+prompt { text-color: @primary; padding: 0 10px 0 0; }
+entry { placeholder: "type to execute_"; placeholder-color: @muted; }
+
+message { padding: 8px 16px; border: 0 0 1px 0; border-color: @border-col; }
+textbox { text-color: @amber; }
+
+listview { padding: 8px; spacing: 2px; scrollbar: true; }
+
+element { padding: 8px 12px; border-radius: 4px; spacing: 12px; }
+element-icon { size: 22px; }
+element selected { background-color: @selected; border: 1px; border-color: @secondary; }
+element-text selected { text-color: @primary; }
+element.urgent { text-color: @alert; }
+
+scrollbar { width: 3px; handle-color: @secondary; handle-width: 3px; }
+
+mode-switcher { spacing: 0; border: 1px 0 0 0; border-color: @border-col; }
+button { padding: 10px; text-color: @muted; }
+button selected { text-color: @primary; background-color: @selected; }

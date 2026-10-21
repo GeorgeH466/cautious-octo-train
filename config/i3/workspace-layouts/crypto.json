@@ -1,0 +1,7 @@
+{
+  "border": "pixel", "layout": "splith", "type": "con", "percent": 1.0, "nodes": [
+    { "type": "con", "percent": 0.62, "swallows": [{ "class": "^Alacritty$" }] },
+    { "border": "pixel", "layout": "splitv", "type": "con", "percent": 0.38, "nodes": [
+      { "type": "con", "swallows": [{ "class": "^Alacritty$" }] },
+      { "type": "con", "swallows": [{ "class": "^Alacritty$|^firefox$" }] } ] } ]
+}

@@ -1,0 +1,3 @@
+/* Blood variant */
+@import "~/.config/rofi/config.rasi"
+* { primary: #ff0040; secondary: #cc0033; }

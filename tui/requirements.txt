@@ -1,0 +1,10 @@
+# Cyberdeck TUI + tooling dependencies
+textual>=0.47
+rich>=13.7
+requests>=2.31
+scapy>=2.5
+python-nmap>=0.7
+paramiko>=3.4
+beautifulsoup4>=4.12
+colorama>=0.4
+psutil>=5.9

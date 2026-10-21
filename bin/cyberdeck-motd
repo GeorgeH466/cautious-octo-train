@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# cyberdeck-motd — Message Of The Day shown on each new interactive shell
+[[ -n "${CYBERDECK_NO_MOTD:-}" ]] && exit 0
+for _L in "$HOME/.cyberdeck/lib" "$(cd "$(dirname "$0")/../lib" 2>/dev/null && pwd)"; do [[ -f "$_L/utils.sh" ]] && { LIB="$_L"; break; }; done
+[[ -n "${LIB:-}" ]] || exit 0
+source "$LIB/colors.sh"; source "$LIB/ui.sh"; source "$LIB/utils.sh"
+# Boot splash once per day
+STAMP="$CYBERDECK_HOME/.last-splash"; TODAY="$(date +%Y%m%d)"
+if [[ "$(cat "$STAMP" 2>/dev/null)" != "$TODAY" ]]; then echo "$TODAY" >"$STAMP"; bash "$HOME/.cyberdeck/bin/../scripts/ui/boot-splash.sh" --fast 2>/dev/null || find "$HOME/.cyberdeck" -name boot-splash.sh -exec bash {} --fast \; -quit 2>/dev/null; fi
+printf '%s' "$C_PRIMARY"
+cat <<'LOGO'
+    ┌──────────────────────────────────────────────────────┐
+    │  ◢ CYBERDECK // BLACKARCH  ·  TRON × MR. ROBOT × GiTS │
+    └──────────────────────────────────────────────────────┘
+LOGO
+printf '%s' "$C_RESET"
+kv "Host" "$(hostname) · $(uptime -p | sed 's/up //')"
+kv "Network" "$(default_iface) $(local_ip) ▸ gw $(gateway_ip) ▸ pub $(public_ip 2>/dev/null)"
+kv "Disk / RAM" "$(df -h / | awk 'NR==2{print $3"/"$2" ("$5")"}') · $(free -m | awk '/Mem/{print $3"/"$2" MB"}')"
+kv "Modules" "$(find "$HOME/.cyberdeck/scripts" -name '*.sh' 2>/dev/null | wc -l) tools online · theme: $CYBERDECK_THEME"
+TIPS=(
+ "Rotate keys, not passwords — generate one now: password-gen"
+ "Check who is on your LAN: net-discover"
+ "Audit your own headers: header-analyze https://your-site"
+ "Snapshot integrity today: integrity-check baseline"
+ "Encrypt something: encrypt-file secrets.txt --shred"
+ "Watch for LAN MITM: arp-spoof-detect --watch"
+ "New shell? Run: cyberdeck status for a full SITREP"
+ "Failed logins tell stories: log-analyzer"
+ "Keep the deck sharp: cyberdeck update --check"
+ "Back up encrypted: backup-manager backup"
+)
+printf '  %s▸ TIP:%s %s\n' "$C_AMBER" "$C_RESET" "${TIPS[RANDOM % ${#TIPS[@]}]}"
+printf '  %sType %scyberdeck%s for Mission Control · %scyberdeck help%s for commands%s\n\n' "$C_MUTED" "$C_PRIMARY" "$C_MUTED" "$C_PRIMARY" "$C_MUTED" "$C_RESET"

@@ -1,0 +1,191 @@
+# ════════════════════════════════════════════════════════════════════════
+#  CYBERDECK // i3-gaps — sci-fi operations window manager
+#  Mod = Super · Workspaces are mission bays · Reload: Super+Shift+r
+# ════════════════════════════════════════════════════════════════════════
+set $mod Mod4
+set $term alacritty
+set $menu rofi -show drun -theme ~/.config/rofi/config.rasi
+
+# ── Palette (Ghost default — theme-switcher patches accents live) ───────
+set $bg        #0a0a0a
+set $fg        #e6ffff
+set $primary   #00fff5
+set $secondary #00b8b0
+set $green     #00ff41
+set $amber     #ffb000
+set $alert     #ff0040
+set $muted     #1a2a2a
+set $inactive  #0d1515
+
+font pango:JetBrainsMono Nerd Font 10
+floating_modifier $mod
+focus_follows_mouse no
+mouse_warping none
+workspace_layout default
+default_border pixel 1
+default_floating_border pixel 1
+hide_edge_borders smart
+
+# ── Gaps (i3-gaps) ───────────────────────────────────────────────────────
+gaps inner 10
+gaps outer 4
+smart_gaps on
+smart_borders on
+
+# ── Window colours:           border  bg        text     indicator child
+client.focused                $primary $muted   $fg      $primary  $primary
+client.focused_inactive       $muted   $inactive $fg     $muted    $muted
+client.unfocused              $inactive $bg     #5a7a78  $inactive $inactive
+client.urgent                 $alert   $alert    $bg      $alert    $alert
+client.placeholder            $bg      $inactive $fg      $bg       $inactive
+client.background             $bg
+
+# ── Workspaces = mission bays ────────────────────────────────────────────
+set $ws1  "1:◢ MAIN"
+set $ws2  "2:◈ NET"
+set $ws3  "3:◎ WEB"
+set $ws4  "4:⌖ RECON"
+set $ws5  "5:⚔ EXPLOIT"
+set $ws6  "6:⛨ DEFENSE"
+set $ws7  "7:⚿ CRYPTO"
+set $ws8  "8:▤ FILES"
+set $ws9  "9:✉ COMMS"
+set $ws10 "10:⚙ SYS"
+
+assign [class="firefox|Firefox|Chromium|Brave-browser"] $ws3
+assign [class="BurpSuite|burpsuite|ZAP"] $ws5
+assign [class="Wireshark"] $ws2
+assign [class="KeePassXC"] $ws7
+assign [class="Thunderbird|discord|TelegramDesktop|Signal"] $ws9
+assign [class="Pavucontrol|Blueman-manager|Lxappearance"] $ws10
+for_window [class="Pavucontrol|Blueman-manager"] floating enable, resize set 900 600, move position center
+for_window [window_role="pop-up"] floating enable
+for_window [title="cava"] floating enable, resize set 1000 320, move position center
+
+bindsym $mod+1 workspace $ws1
+bindsym $mod+2 workspace $ws2
+bindsym $mod+3 workspace $ws3
+bindsym $mod+4 workspace $ws4
+bindsym $mod+5 workspace $ws5
+bindsym $mod+6 workspace $ws6
+bindsym $mod+7 workspace $ws7
+bindsym $mod+8 workspace $ws8
+bindsym $mod+9 workspace $ws9
+bindsym $mod+0 workspace $ws10
+bindsym $mod+Shift+1 move container to workspace $ws1
+bindsym $mod+Shift+2 move container to workspace $ws2
+bindsym $mod+Shift+3 move container to workspace $ws3
+bindsym $mod+Shift+4 move container to workspace $ws4
+bindsym $mod+Shift+5 move container to workspace $ws5
+bindsym $mod+Shift+6 move container to workspace $ws6
+bindsym $mod+Shift+7 move container to workspace $ws7
+bindsym $mod+Shift+8 move container to workspace $ws8
+bindsym $mod+Shift+9 move container to workspace $ws9
+bindsym $mod+Shift+0 move container to workspace $ws10
+bindsym $mod+Tab workspace back_and_forth
+bindsym $mod+comma workspace prev
+bindsym $mod+period workspace next
+
+# ── Focus / move (vim + arrows) ──────────────────────────────────────────
+bindsym $mod+h focus left
+bindsym $mod+j focus down
+bindsym $mod+k focus up
+bindsym $mod+l focus right
+bindsym $mod+Left focus left
+bindsym $mod+Down focus down
+bindsym $mod+Up focus up
+bindsym $mod+Right focus right
+bindsym $mod+Shift+h move left
+bindsym $mod+Shift+j move down
+bindsym $mod+Shift+k move up
+bindsym $mod+Shift+l move right
+bindsym $mod+Shift+Left move left
+bindsym $mod+Shift+Down move down
+bindsym $mod+Shift+Up move up
+bindsym $mod+Shift+Right move right
+
+# ── Layout ───────────────────────────────────────────────────────────────
+bindsym $mod+s layout stacking
+bindsym $mod+w layout tabbed
+bindsym $mod+e layout toggle split
+bindsym $mod+Shift+space floating toggle
+bindsym $mod+space focus mode_toggle
+bindsym $mod+f fullscreen toggle
+bindsym $mod+a focus parent
+bindsym $mod+v split v
+bindsym $mod+Shift+v split h
+bindsym $mod+Shift+q kill
+bindsym $mod+g gaps inner all toggle 10
+mode "resize" {
+    bindsym h resize shrink width 10 px or 10 ppt
+    bindsym j resize grow height 10 px or 10 ppt
+    bindsym k resize shrink height 10 px or 10 ppt
+    bindsym l resize grow width 10 px or 10 ppt
+    bindsym Left resize shrink width 10 px or 10 ppt
+    bindsym Down resize grow height 10 px or 10 ppt
+    bindsym Up resize shrink height 10 px or 10 ppt
+    bindsym Right resize grow width 10 px or 10 ppt
+    bindsym Return mode "default"
+    bindsym Escape mode "default"
+    bindsym $mod+r mode "default"
+}
+bindsym $mod+r mode "resize"
+
+# ── Launchers ────────────────────────────────────────────────────────────
+bindsym $mod+Return exec --no-startup-id $term
+bindsym $mod+Shift+Return exec --no-startup-id $term -e tmux new-session -A -s deck
+bindsym $mod+d exec --no-startup-id $menu
+bindsym $mod+Shift+d exec --no-startup-id ~/.config/i3/scripts/rofi-scripts.sh
+bindsym $mod+Shift+f exec --no-startup-id $term -e ranger
+bindsym $mod+Shift+b exec --no-startup-id firefox
+
+# ── Cyberdeck operations ─────────────────────────────────────────────────
+bindsym $mod+F1 exec --no-startup-id $term -e cyberdeck
+bindsym $mod+F2 exec --no-startup-id $term -e cyberdeck dashboard network; workspace $ws2
+bindsym $mod+F3 exec --no-startup-id $term -e cyberdeck dashboard recon; workspace $ws4
+bindsym $mod+F4 exec --no-startup-id $term -e cyberdeck dashboard defense; workspace $ws6
+bindsym $mod+F5 exec --no-startup-id $term -e cyberdeck dashboard crypto; workspace $ws7
+bindsym $mod+n exec --no-startup-id $term -e bash -c 'net-discover; echo; net-scan; exec $SHELL'
+bindsym $mod+m exec --no-startup-id ~/.config/i3/scripts/toggle-cava.sh
+bindsym $mod+b exec --no-startup-id ~/.config/i3/scripts/toggle-polybar.sh
+bindsym $mod+Shift+l exec --no-startup-id lock-screen
+bindsym $mod+Shift+s exec --no-startup-id ~/.config/i3/scripts/screenshot.sh
+bindsym $mod+Shift+t exec --no-startup-id theme-switcher
+bindsym $mod+Shift+m exec --no-startup-id $term -e matrix-rain
+bindsym $mod+p exec --no-startup-id ~/.config/i3/scripts/power-menu.sh
+
+# ── Scratchpad terminal ──────────────────────────────────────────────────
+for_window [title="scratchterm"] move scratchpad, resize set 1200 700, move position center
+bindsym $mod+grave exec --no-startup-id ~/.config/i3/scripts/scratchpad-term.sh
+
+# ── Media / brightness / volume ──────────────────────────────────────────
+bindsym XF86AudioRaiseVolume exec --no-startup-id pactl set-sink-volume @DEFAULT_SINK@ +5% && ~/.config/i3/scripts/volume-notify.sh
+bindsym XF86AudioLowerVolume exec --no-startup-id pactl set-sink-volume @DEFAULT_SINK@ -5% && ~/.config/i3/scripts/volume-notify.sh
+bindsym XF86AudioMute exec --no-startup-id pactl set-sink-mute @DEFAULT_SINK@ toggle && ~/.config/i3/scripts/volume-notify.sh
+bindsym XF86AudioPlay exec --no-startup-id playerctl play-pause
+bindsym XF86AudioNext exec --no-startup-id playerctl next
+bindsym XF86AudioPrev exec --no-startup-id playerctl previous
+bindsym XF86MonBrightnessUp exec --no-startup-id brightnessctl set +5%
+bindsym XF86MonBrightnessDown exec --no-startup-id brightnessctl set 5%-
+bindsym Print exec --no-startup-id ~/.config/i3/scripts/screenshot.sh full
+
+# ── Session ──────────────────────────────────────────────────────────────
+bindsym $mod+Shift+c reload
+bindsym $mod+Shift+r restart
+bindsym $mod+Shift+e exec "i3-nagbar -t warning -m '◢ SHUT DOWN CYBERDECK SESSION?' -B 'Yes, exit i3' 'i3-msg exit'"
+
+# No built-in bar — polybar HUD instead
+# bar { status_command i3status }
+
+# ── Autostart ────────────────────────────────────────────────────────────
+exec --no-startup-id ~/.config/polybar/launch.sh
+exec --no-startup-id picom --config ~/.config/picom/picom.conf -b
+exec --no-startup-id dunst
+exec --no-startup-id feh --bg-fill --randomize ~/.cyberdeck/wallpapers/ 2>/dev/null || feh --bg-fill ~/.cyberdeck/wallpapers/ghost-grid.png
+exec --no-startup-id ~/.config/conky/start-conky.sh
+exec --no-startup-id cyberdeck-netdaemon
+exec --no-startup-id nm-applet
+exec --no-startup-id /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1
+exec --no-startup-id xset s 600 600; xss-lock -n "notify-send 'Cyberdeck' 'Locking in 10s'" -- lock-screen
+exec --no-startup-id $term -e cyberdeck dashboard main
+exec --no-startup-id notify-send "◢ CYBERDECK ONLINE" "Super+F1 Mission Control · Super+d launcher · Super+n LAN scan"

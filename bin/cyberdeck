@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# cyberdeck — main entry point for Cyberdeck-BlackArch
+set -uo pipefail
+_SDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$_SDIR/.."; [[ -d "$ROOT/scripts" ]] || ROOT="$HOME/.cyberdeck"
+for _L in "$ROOT/lib" "$HOME/.cyberdeck/lib"; do [[ -f "$_L/utils.sh" ]] && { LIB="$_L"; break; }; done
+[[ -n "${LIB:-}" ]] && { source "$LIB/colors.sh"; source "$LIB/ui.sh"; source "$LIB/utils.sh"; } || { echo "cyberdeck lib missing — run ./install.sh" >&2; exit 1; }
+S="$ROOT/scripts"; [[ -d "$S" ]] || S="$HOME/.cyberdeck/scripts"
+D="$ROOT/dashboards"; [[ -d "$D" ]] || D="$HOME/.cyberdeck/dashboards"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  ""|tui|mission-control) exec bash "$S/cyberdeck/mission-control.sh" "$@" ;;
+  dashboard|dash) n="${1:-main}"; case "$n" in
+      main) f="$D/main-dashboard.sh";; network|net) f="$D/network-ops.sh";; recon) f="$D/recon-dashboard.sh";;
+      defense|def) f="$D/defense-dashboard.sh";; crypto) f="$D/crypto-dashboard.sh";; *) die "dashboards: main|network|recon|defense|crypto";; esac
+    exec bash "$f" "$@" ;;
+  scan) exec bash "$S/network/net-scan.sh" "$@" ;;
+  discover) exec bash "$S/network/net-discover.sh" "$@" ;;
+  tools) cyber_banner "TOOL REGISTRY" "every module on this deck"
+    for c in network recon exploit defense crypto system ui cyberdeck; do section "${c^^}"
+      for f in "$S/$c"/*.sh; do [[ -e "$f" ]] && printf '  ▸ %-24s %s\n' "$(basename "$f" .sh)" "$(grep -m1 '^# .*\.sh —' "$f" | sed 's/.*— //')"; done; done
+    info "Total modules: $(find "$S" -name '*.sh' | wc -l) — every one supports --help" ;;
+  theme) exec bash "$S/ui/theme-switcher.sh" "${1:---list}" ;;
+  status) exec bash "$S/cyberdeck/status-board.sh" "$@" ;;
+  update) exec bash "$S/system/update-all.sh" "$@" ;;
+  lock) exec bash "$S/ui/lock-screen.sh" "$@" ;;
+  menu) exec bash "$S/cyberdeck/toolkit-menu.sh" "$@" ;;
+  cheat|cheatsheet) exec bash "$S/cyberdeck/cheatsheet.sh" "$@" ;;
+  logs) exec bash "$S/cyberdeck/log-viewer.sh" "$@" ;;
+  splash) exec bash "$S/ui/boot-splash.sh" "$@" ;;
+  version|-v|--version) echo "cyberdeck-blackarch 1.0.0 · theme=$CYBERDECK_THEME · $(find "$S" -name '*.sh'|wc -l) modules" ;;
+  help|-h|--help) cyber_banner "CYBERDECK" "command reference"; cat <<H
+  cyberdeck                      Launch Mission Control TUI
+  cyberdeck dashboard [name]     tmux dashboard: main|network|recon|defense|crypto
+  cyberdeck scan [target] [mode] Quick nmap scan (net-scan)
+  cyberdeck discover [subnet]    LAN host discovery
+  cyberdeck tools                List every module
+  cyberdeck menu [category]      Categorised tool launcher
+  cyberdeck theme [name]         ghost|matrix|amber|blood
+  cyberdeck status [--watch]     Full status board
+  cyberdeck logs [src] [filter]  Central log viewer
+  cyberdeck cheat [topic]        Cheatsheets
+  cyberdeck lock                 Sci-fi lock screen
+  cyberdeck update               Update system + deck
+  cyberdeck splash               Boot splash animation
+  cyberdeck version / help
+
+  Every module is also on PATH by name, e.g.  net-scan --help
+H
+    ;;
+  *) # passthrough: cyberdeck <module-name> args…
+    f="$(find "$S" -name "$cmd.sh" -print -quit 2>/dev/null)"; [[ -n "$f" ]] && exec bash "$f" "$@"
+    err "Unknown command '$cmd' — try: cyberdeck help"; exit 1 ;;
+esac

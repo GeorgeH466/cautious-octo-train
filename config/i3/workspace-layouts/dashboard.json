@@ -1,0 +1,9 @@
+{
+  "border": "pixel", "layout": "splith", "type": "con", "nodes": [
+    { "border": "pixel", "layout": "splitv", "type": "con", "nodes": [
+      { "type": "con", "swallows": [{ "class": "^Alacritty$" }] },
+      { "type": "con", "swallows": [{ "class": "^Alacritty$" }] } ] },
+    { "border": "pixel", "layout": "splitv", "type": "con", "nodes": [
+      { "type": "con", "swallows": [{ "class": "^Alacritty$" }] },
+      { "type": "con", "swallows": [{ "class": "^Alacritty$" }] } ] } ]
+}

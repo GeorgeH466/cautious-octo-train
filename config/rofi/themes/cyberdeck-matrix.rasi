@@ -1,0 +1,3 @@
+/* Matrix variant — select via: rofi -theme ~/.config/rofi/themes/cyberdeck-matrix */
+@import "~/.config/rofi/config.rasi"
+* { primary: #00ff41; secondary: #00cc33; }

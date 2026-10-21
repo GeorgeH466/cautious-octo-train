@@ -1,0 +1,5 @@
+{
+  "name": "amber",
+  "background": "#140e04", "foreground": "#ffe6b3", "primary": "#ffb000",
+  "secondary": "#ff8c00", "accent": "#ffd166", "muted": "#8a6d2f", "warn": "#ffb000", "alert": "#ff0040"
+}

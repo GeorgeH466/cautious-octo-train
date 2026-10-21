@@ -1,0 +1,3 @@
+/* Amber variant */
+@import "~/.config/rofi/config.rasi"
+* { primary: #ffb000; secondary: #ff8c00; bg: rgba(20,14,4,94%); }

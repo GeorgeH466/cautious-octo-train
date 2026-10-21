@@ -1,0 +1,138 @@
+# CYBERDECK // Alacritty — Ghost theme (theme-switcher patches background/foreground/cursor)
+# CRT feel comes from: slight transparency + picom blur + font rendering below.
+# For true scanlines use cool-retro-term (alias: crt) — Alacritty has no shader scanlines.
+
+[env]
+TERM = "xterm-256color"
+
+[window]
+opacity = 0.88
+dynamic_padding = true
+decorations = "none"
+startup_mode = "Windowed"
+
+[window.padding]
+x = 10
+y = 10
+
+[window.dimensions]
+columns = 120
+lines = 34
+
+[scrolling]
+history = 50000
+multiplier = 3
+
+[font]
+size = 11.0
+# Slightly expanded offsets + built-in box drawing give the crisp HUD look
+builtin_box_drawing = true
+
+[font.normal]
+family = "JetBrainsMono Nerd Font"
+style = "Regular"
+
+[font.bold]
+family = "JetBrainsMono Nerd Font"
+style = "Bold"
+
+[font.italic]
+family = "JetBrainsMono Nerd Font"
+style = "Italic"
+
+[font.bold_italic]
+family = "JetBrainsMono Nerd Font"
+style = "Bold Italic"
+
+[font.offset]
+x = 0
+y = 1
+
+[colors.primary]
+background = "#0a0a0a"
+foreground = "#e6ffff"
+dim_foreground = "#5a7a78"
+bright_foreground = "#ffffff"
+
+[colors.cursor]
+text = "#0a0a0a"
+cursor = "#00fff5"
+
+[colors.vi_mode_cursor]
+text = "#0a0a0a"
+cursor = "#ffb000"
+
+[colors.selection]
+text = "#e6ffff"
+background = "#0f3a3a"
+
+[colors.search.matches]
+foreground = "#0a0a0a"
+background = "#ffb000"
+
+[colors.search.focused_match]
+foreground = "#0a0a0a"
+background = "#00ff41"
+
+[colors.normal]
+black = "#11181c"
+red = "#ff0040"
+green = "#00ff41"
+yellow = "#ffb000"
+blue = "#00b8ff"
+magenta = "#ff00c8"
+cyan = "#00fff5"
+white = "#c8e6e6"
+
+[colors.bright]
+black = "#2a3a3d"
+red = "#ff4d79"
+green = "#5cff8a"
+yellow = "#ffd166"
+blue = "#5cd6ff"
+magenta = "#ff5ce1"
+cyan = "#7dfff8"
+white = "#ffffff"
+
+[colors.dim]
+black = "#0a0f11"
+red = "#8a0022"
+green = "#008a24"
+yellow = "#8a5f00"
+blue = "#00638a"
+magenta = "#8a006c"
+cyan = "#008a86"
+white = "#6b8a8a"
+
+[cursor]
+style = { shape = "Block", blinking = "On" }
+blink_interval = 530
+thickness = 0.15
+
+[mouse]
+hide_when_typing = true
+
+[[keyboard.bindings]]
+key = "V"
+mods = "Control|Shift"
+action = "Paste"
+
+[[keyboard.bindings]]
+key = "C"
+mods = "Control|Shift"
+action = "Copy"
+
+[[keyboard.bindings]]
+key = "Plus"
+mods = "Control"
+action = "IncreaseFontSize"
+
+[[keyboard.bindings]]
+key = "Minus"
+mods = "Control"
+action = "DecreaseFontSize"
+
+[[hints.enabled]]
+regex = "(https?://|ftp://)[^\\s/$.?#].[^\\s]*"
+command = "xdg-open"
+mouse = { enabled = true, mods = "Control" }

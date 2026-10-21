@@ -1,0 +1,12 @@
+[Icon Theme]
+Name=Cyberdeck
+Comment=Sci-fi HUD icon overrides (inherits Papirus-Dark)
+Inherits=Papirus-Dark,Adwaita,hicolor
+Directories=apps
+
+[apps]
+Size=48
+Context=Applications
+Type=Scalable
+MinSize=16
+MaxSize=256
